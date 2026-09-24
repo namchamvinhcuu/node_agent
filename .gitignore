@@ -1,0 +1,39 @@
+# Secrets / config that (dung .env.example lam template)
+.env
+.env.bak-*
+
+# Kenh cua CHINH node nay - dac thu cam bien/site, dung channels.example.json lam template
+channels.json
+
+# State runtime (SQLite outbox/api_key hoc duoc tu edge - la secret, kv boot_id/seq)
+var/
+var_bak_*/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtualenv (venv chua duong dan tuyet doi cua may goc, khong dung lai duoc)
+venv/
+venv_linux/
+.venv/
+
+# Serena MCP local cache/config (per-machine, khong can versioning)
+.serena/
+.claude/
+.gemini/
+
+# CLAUDE.md = symlink per-machine -> sync qua claude-agents (khong commit)
+/CLAUDE.md
+CLAUDE.md
+AGENTS.md
+.vault-portal.conf
+
+# Vault + skill vault dung chung - symlink per-machine, source o repo rieng
+.obsidian-vault
+.python-skill
+.common-skill
+
+# graphify artifact - per-may, dung lai duoc bang `graphify update .`
+graphify-out/

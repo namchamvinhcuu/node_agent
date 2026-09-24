@@ -1,0 +1,29 @@
+[
+  {
+    "code": "scale_wt",
+    "mode": "sim",
+    "poll_ms": 500,
+    "center": 412.4,
+    "spread": 0.3
+  },
+  {
+    "code": "temp1",
+    "mode": "sim",
+    "poll_ms": 2000,
+    "center": 23.4,
+    "spread": 0.4
+  },
+  {
+    "code": "scale_real",
+    "mode": "serial",
+    "port": "/dev/ttyUSB0",
+    "baud": 9600,
+    "terminator": "\r\n",
+    "pattern": "^(ST|US),\\s*(GS|NT),\\s*([+-]?\\s*[\\d.]+)\\s*(\\w+)$",
+    "value_group": 3,
+    "stable_group": 1,
+    "stable_ok": "ST",
+    "cmd_zero": "Z\r\n",
+    "cmd_tare": "T\r\n"
+  }
+]
