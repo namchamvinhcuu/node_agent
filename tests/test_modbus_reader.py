@@ -11,14 +11,43 @@ pymodbus la dependency BAT BUOC, va loi ImportError bi nuot nham thanh
 "khong ket noi duoc" trong vong retry). Vi vay phai patch dung namespace SU
 DUNG `node_agent.readers.modbus.ModbusTcpClient`/`ModbusSerialClient`
 (KHONG phai `pymodbus.client.ModbusTcpClient` - patch tai nguon dinh nghia
-se KHONG co tac dung len ten da bind vao module modbus.py tu luc import)."""
+se KHONG co tac dung len ten da bind vao module modbus.py tu luc import).
+
+Cap nhat 2026-09-25 (shared-client registry, fix bug that tren OrangePi3B
+"[Errno 11] Could not exclusively lock port"): `ModbusReader._connect()`
+KHONG CON TON TAI - thay bang `_client_key`/`_client_factory` (tinh san
+trong __init__) + module-level `_SharedModbusClient`/`_get_shared_client()`
+(registry theo key). `_run()` goi `_get_shared_client(...).acquire()` MOT
+LAN luc bat dau, vong lap ngoai goi `self._client.ensure_connected()` (KHONG
+phai `self._connect()`), vong lap trong KHONG con dong client khi loi doc.
+Xem docstring dau file `node_agent/readers/modbus.py` de biet ly do."""
 import threading
 import time
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from node_agent.readers.modbus import ModbusReader, _decode, _encode
+from node_agent.readers.modbus import (
+    ModbusReader,
+    _decode,
+    _encode,
+    _get_shared_client,
+    _MAX_CONSECUTIVE_ERRORS,
+    _shared_clients,
+    _SharedModbusClient,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_shared_client_registry():
+    """Registry `_shared_clients` la module-level dict, TON TAI xuyen suot
+    process - khong clear se lam test SAU dung lai _SharedModbusClient (voi
+    client/mock cu) ma test TRUOC da tao ra cung 1 client_key (vd _tcp_cfg()
+    mac dinh luon la ("tcp", "10.0.0.5", 502)), gay test order-dependency
+    (flaky/sai lech tuy thu tu chay)."""
+    _shared_clients.clear()
+    yield
+    _shared_clients.clear()
 
 
 # ----------------------------------------------------------------------
@@ -150,7 +179,8 @@ def test_init_poll_ms_numeric_string_parses_correctly():
 
 
 # ----------------------------------------------------------------------
-# 3) ModbusReader._connect()
+# 3) ModbusReader.__init__() - _client_key / _client_factory (thay the
+#    _connect() cu da bi xoa - xem docstring dau file)
 
 def _tcp_cfg(**overrides):
     cfg = {"code": "ch1", "conn_type": "tcp", "host": "10.0.0.5", "tcp_port": 502}
@@ -164,48 +194,354 @@ def _rtu_cfg(**overrides):
     return cfg
 
 
-def test_connect_tcp_success_creates_client_with_host_and_port():
+def test_init_tcp_computes_client_key_from_host_and_port():
+    reader = ModbusReader(_tcp_cfg(), emit=Mock())
+
+    assert reader._client_key == ("tcp", "10.0.0.5", 502)
+
+
+def test_init_rtu_computes_client_key_from_port_and_baud():
+    reader = ModbusReader(_rtu_cfg(), emit=Mock())
+
+    assert reader._client_key == ("rtu", "/dev/ttyUSB1", 19200)
+
+
+def test_client_factory_tcp_creates_client_with_host_and_port():
     reader = ModbusReader(_tcp_cfg(), emit=Mock())
     fake_client = MagicMock()
-    fake_client.connect.return_value = True
 
     with patch("node_agent.readers.modbus.ModbusTcpClient", return_value=fake_client) as mock_tcp:
-        reader._connect()
+        client = reader._client_factory()
 
     mock_tcp.assert_called_once_with("10.0.0.5", port=502)
-    assert reader._client is fake_client
+    assert client is fake_client
 
 
-def test_connect_rtu_success_creates_client_with_port_and_baudrate():
+def test_client_factory_rtu_creates_client_with_port_and_baudrate():
     reader = ModbusReader(_rtu_cfg(), emit=Mock())
     fake_client = MagicMock()
-    fake_client.connect.return_value = True
 
     with patch("node_agent.readers.modbus.ModbusSerialClient", return_value=fake_client) as mock_serial:
-        reader._connect()
+        client = reader._client_factory()
 
     mock_serial.assert_called_once_with("/dev/ttyUSB1", baudrate=19200)
-    assert reader._client is fake_client
+    assert client is fake_client
 
 
-def test_connect_tcp_failure_raises_connection_error():
-    reader = ModbusReader(_tcp_cfg(), emit=Mock())
-    fake_client = MagicMock()
+# ----------------------------------------------------------------------
+# 3b) _SharedModbusClient - acquire/release refcount, ensure_connected,
+#     _io_lock serialize I/O
+
+def _fake_underlying_client(connected=True):
+    client = MagicMock()
+    client.is_socket_open.return_value = connected
+    client.connect.return_value = True
+    return client
+
+
+def test_shared_client_ensure_connected_calls_connect_when_socket_not_open():
+    fake_client = _fake_underlying_client(connected=False)
+    shared = _SharedModbusClient(factory=lambda: fake_client)
+    shared.acquire()
+
+    shared.ensure_connected()
+
+    fake_client.connect.assert_called_once()
+
+
+def test_shared_client_ensure_connected_skips_connect_when_socket_already_open():
+    fake_client = _fake_underlying_client(connected=True)
+    shared = _SharedModbusClient(factory=lambda: fake_client)
+    shared.acquire()
+
+    shared.ensure_connected()
+
+    fake_client.connect.assert_not_called()
+
+
+def test_shared_client_ensure_connected_raises_connection_error_when_connect_fails():
+    fake_client = _fake_underlying_client(connected=False)
     fake_client.connect.return_value = False
+    shared = _SharedModbusClient(factory=lambda: fake_client)
+    shared.acquire()
 
-    with patch("node_agent.readers.modbus.ModbusTcpClient", return_value=fake_client):
-        with pytest.raises(ConnectionError):
-            reader._connect()
+    with pytest.raises(ConnectionError):
+        shared.ensure_connected()
 
 
-def test_connect_rtu_failure_raises_connection_error():
-    reader = ModbusReader(_rtu_cfg(), emit=Mock())
+def test_shared_client_ensure_connected_raises_when_client_already_released():
+    shared = _SharedModbusClient(factory=lambda: _fake_underlying_client())
+    # KHONG goi acquire() - self._client con la None (giong trang thai sau
+    # khi refcount ve 0 va release() da dong+xoa client).
+
+    with pytest.raises(ConnectionError):
+        shared.ensure_connected()
+
+
+def test_shared_client_acquire_release_refcount_closes_only_on_last_release():
+    """2 lan acquire() (2 ModbusReader dung chung) + 1 lan release() -> client
+    CHUA duoc dong (con reader kia dang dung). Release lan 2 (refcount ve 0)
+    moi thuc su dong+xoa client."""
+    fake_client = _fake_underlying_client()
+    shared = _SharedModbusClient(factory=lambda: fake_client)
+
+    shared.acquire()
+    shared.acquire()
+    shared.release()
+
+    fake_client.close.assert_not_called()
+    assert shared._client is fake_client
+
+    shared.release()
+
+    fake_client.close.assert_called_once()
+    assert shared._client is None
+
+
+def test_shared_client_io_lock_serializes_concurrent_reads_no_overlap():
+    """2 thread goi read_holding_registers() DONG THOI tren CUNG 1
+    _SharedModbusClient - _io_lock phai serial hoa, khong duoc chong lap
+    thoi gian thuc thi (RTU la half-duplex, GIL Python khong bao ve duoc
+    chuyen nay - day la gioi han giao thuc serial, khong phai gioi han ngon
+    ngu - xem docstring dau file modbus.py)."""
+    intervals = []
+    intervals_lock = threading.Lock()
+
+    def slow_read(*args, **kwargs):
+        start = time.monotonic()
+        time.sleep(0.05)
+        end = time.monotonic()
+        with intervals_lock:
+            intervals.append((start, end))
+        return Mock()
+
+    fake_client = _fake_underlying_client()
+    fake_client.read_holding_registers.side_effect = slow_read
+    shared = _SharedModbusClient(factory=lambda: fake_client)
+    shared.acquire()
+
+    t1 = threading.Thread(target=shared.read_holding_registers, args=(0,), kwargs={"count": 1})
+    t2 = threading.Thread(target=shared.read_holding_registers, args=(0,), kwargs={"count": 1})
+    t1.start()
+    t2.start()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+
+    assert len(intervals) == 2
+    (s1, e1), (s2, e2) = intervals
+    # Khong overlap: 1 khoang phai ket thuc TRUOC khi khoang kia bat dau.
+    assert e1 <= s2 or e2 <= s1, f"2 lan doc chong lap thoi gian: {intervals}"
+
+
+# ----------------------------------------------------------------------
+# 3b-2) Regression cho 3 finding python-reviewer 2026-09-25 (sua boi main,
+#       KHONG phai boi test-writer - xem docstring class _SharedModbusClient
+#       trong modbus.py: release()/ensure_connected()/acquire()/_call())
+
+def test_shared_client_release_closes_only_after_pending_io_completes_no_lock_nesting():
+    """Regression Major #1: TRUOC DAY release() goi close() trong luc GIU
+    _registry_lock ma KHONG giu _io_lock - co the chay SONG SONG voi 1 lenh
+    doc/ghi dang do dang tren CUNG client (vd command() dang write_register()
+    dung luc reader cuoi cung goi release()). Fix: giam refcount duoi
+    _registry_lock, tinh should_close, RA KHOI _registry_lock moi close()
+    duoi _io_lock RIENG - dam bao close() KHONG BAO GIO chay xen giua luc 1
+    lenh I/O dang thuc thi (ca hai deu phai giu cung _io_lock).
+
+    Verify bang 2 thread that: 1 thread dang "write" cham (mock sleep 0.05s),
+    1 thread khac goi release() ngay sau do - assert thu tu ghi nhan la
+    write_start -> write_end -> close (khong bao gio la write_start ->
+    close -> write_end, chung minh khong lot lock)."""
+    order = []
+    order_lock = threading.Lock()
+
+    def slow_write(*args, **kwargs):
+        with order_lock:
+            order.append("write_start")
+        time.sleep(0.05)
+        with order_lock:
+            order.append("write_end")
+        return Mock()
+
+    def record_close():
+        with order_lock:
+            order.append("close")
+
+    fake_client = _fake_underlying_client()
+    fake_client.write_register.side_effect = slow_write
+    fake_client.close.side_effect = record_close
+
+    shared = _SharedModbusClient(factory=lambda: fake_client)
+    shared.acquire()  # refcount = 1
+
+    write_thread = threading.Thread(target=shared.write_register, args=(0, 1), kwargs={"device_id": 1})
+    write_thread.start()
+    time.sleep(0.02)  # dam bao write_start da duoc ghi truoc khi release() chay
+    release_thread = threading.Thread(target=shared.release)
+    release_thread.start()
+    write_thread.join(timeout=2)
+    release_thread.join(timeout=2)
+
+    assert not write_thread.is_alive()
+    assert not release_thread.is_alive()
+    assert order == ["write_start", "write_end", "close"], (
+        f"close() da xen vao giua 1 lenh I/O dang chay (lock nesting sai): {order}")
+    assert shared._client is None
+
+
+def test_shared_client_call_increments_consecutive_errors_on_exception():
+    fake_client = _fake_underlying_client()
+    fake_client.read_holding_registers.side_effect = IOError("timeout")
+    shared = _SharedModbusClient(factory=lambda: fake_client)
+    shared.acquire()
+
+    for _ in range(_MAX_CONSECUTIVE_ERRORS):
+        with pytest.raises(IOError):
+            shared.read_holding_registers(0, count=1, device_id=1)
+
+    assert shared._consecutive_errors == _MAX_CONSECUTIVE_ERRORS
+
+
+def test_shared_client_call_resets_consecutive_errors_on_success():
+    """`_consecutive_errors` KHONG duoc tich luy xuyen qua 1 lan goi THANH
+    CONG xen giua - phai reset ve 0 ngay lap tuc, khong doi den khi dat
+    nguong moi reset."""
+    fake_client = _fake_underlying_client()
+    fake_client.read_holding_registers.side_effect = [IOError("timeout"), IOError("timeout"), Mock()]
+    shared = _SharedModbusClient(factory=lambda: fake_client)
+    shared.acquire()
+
+    with pytest.raises(IOError):
+        shared.read_holding_registers(0, count=1, device_id=1)
+    with pytest.raises(IOError):
+        shared.read_holding_registers(0, count=1, device_id=1)
+    assert shared._consecutive_errors == 2
+
+    shared.read_holding_registers(0, count=1, device_id=1)  # lan nay thanh cong
+
+    assert shared._consecutive_errors == 0
+
+
+def test_shared_client_ensure_connected_force_closes_and_reconnects_after_max_consecutive_errors():
+    """Regression QUAN TRONG NHAT cho finding Major #2 (bug that da verify
+    thuc nghiem bang socat): pymodbus sync client KHONG tu dong chuyen
+    is_socket_open() ve False du giao thuc bi 'treo' o tang ung dung (timeout
+    lien tiep, count_until_disconnect am) - is_socket_open() van tra True
+    mai mai (mo phong bang gia tri co dinh True cua mock TRUOC khi close()
+    duoc goi that su - dung nhu bug that: OS socket van 'trong con', chi
+    close() cuong che moi thuc su dat lai trang thai). Neu khong dem loi lien
+    tiep va cuong che dong+mo lai sau _MAX_CONSECUTIVE_ERRORS lan, reader se
+    treo VINH VIEN o muc giao thuc toi khi restart ca tien trinh."""
+    fake_client = _fake_underlying_client(connected=True)
+    fake_client.read_holding_registers.side_effect = IOError("timeout")
+    fake_client.connect.return_value = True
+
+    def _do_close():
+        # Mo phong hanh vi THAT cua pymodbus: is_socket_open() CHI dung tra
+        # False SAU KHI close() that su chay (truoc do, du giao thuc da
+        # "treo", no van tra True - day chinh la bug Major #2).
+        fake_client.is_socket_open.return_value = False
+
+    fake_client.close.side_effect = _do_close
+
+    shared = _SharedModbusClient(factory=lambda: fake_client)
+    shared.acquire()
+
+    for _ in range(_MAX_CONSECUTIVE_ERRORS):
+        with pytest.raises(IOError):
+            shared.read_holding_registers(0, count=1, device_id=1)
+    assert shared._consecutive_errors == _MAX_CONSECUTIVE_ERRORS
+
+    shared.ensure_connected()
+
+    fake_client.close.assert_called_once()
+    assert shared._consecutive_errors == 0
+    fake_client.connect.assert_called_once()  # cuong che dong xong phai reconnect lai
+
+
+def test_shared_client_acquire_does_not_increment_refcount_when_factory_raises():
+    """Regression Minor: acquire() TRUOC DAY tang _refcount TRUOC khi goi
+    factory() - neu factory() raise (vd port khong ton tai/khong du quyen),
+    _refcount se bi LECH vinh vien (tang nhung client khong duoc tao, reader
+    khac dung chung key sau nay se khong bao gio thay refcount ve 0 dung).
+    Fix: tang refcount SAU khi factory() thanh cong."""
+    def failing_factory():
+        raise OSError("khong mo duoc cong")
+
+    shared = _SharedModbusClient(factory=failing_factory)
+
+    with pytest.raises(OSError):
+        shared.acquire()
+
+    assert shared._refcount == 0
+    assert shared._client is None
+
+
+def test_run_factory_raises_sets_error_status_and_returns_cleanly_without_crash():
+    """Test o tang ModbusReader._run(): factory() raise (qua acquire()) ->
+    status.error duoc set, status.online=False, _run() return SACH (khong
+    crash ca thread, khong lot vao vong lap chinh, khong goi release() tren
+    client chua bao gio duoc tao)."""
+    reader = ModbusReader(_tcp_cfg(poll_ms=10), emit=Mock())
+
+    def failing_factory():
+        raise OSError("khong mo duoc cong")
+
+    fake_shared = _SharedModbusClient(factory=failing_factory)
+
+    with patch("node_agent.readers.modbus._get_shared_client", return_value=fake_shared):
+        t = threading.Thread(target=reader._run, daemon=True)
+        t.start()
+        t.join(timeout=2)
+
+    assert not t.is_alive()
+    assert reader.status.online is False
+    assert "khong mo duoc cong" in reader.status.error
+    assert reader._client is None
+
+
+# ----------------------------------------------------------------------
+# 3c) _get_shared_client() - registry theo key
+
+def test_get_shared_client_same_key_returns_same_object():
+    key = ("tcp", "1.2.3.4", 502)
+    factory = lambda: MagicMock()  # noqa: E731
+
+    client_a = _get_shared_client(key, factory)
+    client_b = _get_shared_client(key, factory)
+
+    assert client_a is client_b
+
+
+def test_get_shared_client_different_key_returns_different_object():
+    factory = lambda: MagicMock()  # noqa: E731
+
+    client_a = _get_shared_client(("tcp", "1.2.3.4", 502), factory)
+    client_b = _get_shared_client(("tcp", "5.6.7.8", 502), factory)
+
+    assert client_a is not client_b
+
+
+def test_two_modbus_readers_same_rtu_port_share_one_client_no_exclusive_lock_conflict():
+    """Regression truc tiep cho bug that tren OrangePi3B: 2 kenh Modbus RTU
+    cung cam bien vat ly, cung cong serial (khac `address` thanh ghi) truoc
+    day moi ModbusReader tu goi ModbusSerialClient(...) RIENG -> pymodbus mo
+    voi exclusive=True, reader thu 2 nhan [Errno 11] Could not exclusively
+    lock port. Fix: ca 2 reader CUNG key (conn_type, port, baud) phai dung
+    CHUNG dung 1 _SharedModbusClient, va ModbusSerialClient CHI duoc khoi
+    tao DUNG 1 LAN du co bao nhieu ModbusReader."""
+    reader1 = ModbusReader(_rtu_cfg(address=10), emit=Mock())
+    reader2 = ModbusReader(_rtu_cfg(address=20), emit=Mock())
+    assert reader1._client_key == reader2._client_key  # cung key du khac address
+
     fake_client = MagicMock()
-    fake_client.connect.return_value = False
+    with patch("node_agent.readers.modbus.ModbusSerialClient", return_value=fake_client) as mock_serial:
+        client1 = _get_shared_client(reader1._client_key, reader1._client_factory)
+        client1.acquire()
+        client2 = _get_shared_client(reader2._client_key, reader2._client_factory)
+        client2.acquire()
 
-    with patch("node_agent.readers.modbus.ModbusSerialClient", return_value=fake_client):
-        with pytest.raises(ConnectionError):
-            reader._connect()
+    assert client1 is client2  # cung 1 object _SharedModbusClient
+    mock_serial.assert_called_once_with("/dev/ttyUSB1", baudrate=19200)  # CHI 1 instance duoc tao
 
 
 # ----------------------------------------------------------------------
@@ -284,17 +620,25 @@ def test_read_once_default_scale_offset_is_identity():
 # 5) ModbusReader._run() - vong lap thread that
 
 def test_run_retries_connect_with_increasing_backoff():
-    """3 lan _connect() dau that bai roi thanh cong - self._stop.wait() phai
-    duoc goi voi backoff TANG DAN (1.0 -> 2.0 -> 4.0), khong duoc giu nguyen
-    hang so hay giam."""
+    """3 lan ensure_connected() dau that bai (connect() tra False) roi thanh
+    cong - self._stop.wait() phai duoc goi voi backoff TANG DAN (1.0 -> 2.0
+    -> 4.0), khong duoc giu nguyen hang so hay giam. Dung _SharedModbusClient
+    THAT (khong mock ensure_connected truc tiep) de test ca su ket hop giua
+    logic backoff cua _run() va logic connect() that su cua wrapper."""
     reader = ModbusReader(_tcp_cfg(poll_ms=1000), emit=Mock())
+    fake_underlying = MagicMock()
+    fake_underlying.is_socket_open.return_value = False  # luon coi la chua mo
     attempts = {"n": 0}
 
     def fake_connect():
         attempts["n"] += 1
         if attempts["n"] < 4:
-            raise ConnectionError("khong ket noi duoc")
+            return False
         reader._stop.set()  # thanh cong lan 4 - dung vong lap ngay, khong doc gi them
+        return True
+
+    fake_underlying.connect.side_effect = fake_connect
+    shared = _SharedModbusClient(factory=lambda: fake_underlying)
 
     waits = []
 
@@ -302,12 +646,13 @@ def test_run_retries_connect_with_increasing_backoff():
         waits.append(timeout)
         return False
 
-    with patch.object(reader, "_connect", side_effect=fake_connect), \
+    with patch("node_agent.readers.modbus._get_shared_client", return_value=shared), \
          patch.object(reader._stop, "wait", side_effect=fake_wait):
         reader._run()
 
     assert waits == [1.0, 2.0, 4.0]
     assert attempts["n"] == 4
+    assert shared._refcount == 0  # release() trong finally cua _run() da chay dung 1 lan
 
 
 def test_run_backoff_applies_to_read_failures_not_just_connect_failures():
@@ -330,6 +675,8 @@ def test_run_backoff_applies_to_read_failures_not_just_connect_failures():
     thu: phai Ctrl-C/timeout kill process). Thread + join(timeout) + assert
     not t.is_alive() bien regression do thanh 1 FAIL ro rang thay vi hang."""
     reader = ModbusReader(_tcp_cfg(poll_ms=1000), emit=Mock())
+    fake_underlying = _fake_underlying_client(connected=True)
+    shared = _SharedModbusClient(factory=lambda: fake_underlying)
     waits = []
 
     def fake_wait(timeout=None):
@@ -338,7 +685,7 @@ def test_run_backoff_applies_to_read_failures_not_just_connect_failures():
             reader._stop.set()
         return False
 
-    with patch.object(reader, "_connect", lambda: None), \
+    with patch("node_agent.readers.modbus._get_shared_client", return_value=shared), \
          patch.object(reader, "_read_once", side_effect=IOError("loi doc modbus")), \
          patch.object(reader._stop, "wait", side_effect=fake_wait):
         t = threading.Thread(target=reader._run, daemon=True)
@@ -363,8 +710,10 @@ def test_run_emits_values_in_background_thread_then_stops_cleanly():
         emitted.append((code, value, quality, ok))
 
     reader = ModbusReader(_tcp_cfg(poll_ms=10), emit=fake_emit)
+    fake_underlying = _fake_underlying_client(connected=True)
+    shared = _SharedModbusClient(factory=lambda: fake_underlying)
 
-    with patch.object(reader, "_connect", lambda: None), \
+    with patch("node_agent.readers.modbus._get_shared_client", return_value=shared), \
          patch.object(reader, "_read_once", side_effect=[1.0, 2.0, 3.0, 4.0, 5.0] * 50):
         t = threading.Thread(target=reader._run, daemon=True)
         t.start()
@@ -375,35 +724,48 @@ def test_run_emits_values_in_background_thread_then_stops_cleanly():
     assert not t.is_alive()
     assert len(emitted) >= 1
     assert emitted[0] == ("ch1", 1.0, 0, True)
+    assert reader._client is None  # finally cua _run() da release() va xoa tham chieu
+    assert shared._refcount == 0
 
 
 def test_run_emits_none_and_breaks_inner_loop_on_read_error():
     """_read_once() loi -> emit(code, None, None, 2, False) roi break khoi
-    vong doc, quay lai ket noi lai (khong crash ca thread)."""
+    vong doc trong, quay lai vong ngoai goi lai ensure_connected() (KHONG
+    dong shared client giua chung - khac ban truoc khi chia se client, vi
+    client co the dang duoc reader KHAC dung chung cung luc)."""
     emitted = []
 
     def fake_emit(code, value, raw, quality, ok):
         emitted.append((code, value, quality, ok))
 
     reader = ModbusReader(_tcp_cfg(poll_ms=10), emit=fake_emit)
-    close_calls = []
-    connect_calls = {"n": 0}
+    fake_underlying = _fake_underlying_client(connected=True)
+    shared = _SharedModbusClient(factory=lambda: fake_underlying)
+    ensure_calls = {"n": 0}
+    close_count_seen_during_loop = []
+    real_ensure_connected = shared.ensure_connected
 
-    def fake_connect():
-        connect_calls["n"] += 1
-        reader._client = MagicMock()
-        reader._client.close.side_effect = lambda: close_calls.append(True)
-        if connect_calls["n"] >= 2:
+    def counting_ensure_connected():
+        ensure_calls["n"] += 1
+        close_count_seen_during_loop.append(fake_underlying.close.call_count)
+        if ensure_calls["n"] >= 2:
             reader._stop.set()
+        return real_ensure_connected()
 
-    with patch.object(reader, "_connect", side_effect=fake_connect), \
+    shared.ensure_connected = counting_ensure_connected
+
+    with patch("node_agent.readers.modbus._get_shared_client", return_value=shared), \
          patch.object(reader, "_read_once", side_effect=IOError("loi doc modbus")), \
          patch.object(reader._stop, "wait", return_value=False):
         reader._run()
 
     assert ("ch1", None, 2, False) in emitted
-    assert close_calls  # client phai duoc close() sau khi break khoi vong doc
-    assert connect_calls["n"] == 2
+    assert ensure_calls["n"] == 2  # vong ngoai lap lai (ensure_connected goi lai) sau loi doc
+    # Client KHONG bi dong() giua vong doc (moi lan ensure_connected duoc goi,
+    # close.call_count van la 0) - chi dong DUY NHAT o release() trong finally
+    # cua _run() sau khi da dung han.
+    assert close_count_seen_during_loop == [0, 0]
+    fake_underlying.close.assert_called_once()
 
 
 # ----------------------------------------------------------------------
