@@ -1,0 +1,20 @@
+services:
+  node-agent:
+    build: .
+    image: node-agent:local
+    container_name: node-agent
+    restart: always
+    stop_grace_period: 30s
+    env_file:
+      - .env
+    volumes:
+      - ./channels.json:/app/channels.json:ro
+      - node-agent-var:/app/var
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1.0"
+
+volumes:
+  node-agent-var:

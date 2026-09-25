@@ -1,0 +1,21 @@
+# Override CHI dung khi trien khai that len Pi/PC-bridge co gan USB-serial
+# that (mode: "serial" trong channels.json). Chay:
+#   docker compose -f docker-compose.yml -f docker-compose.hardware.yml up
+#
+# KHONG include file nay khi test/dev bang channels.json toan "mode": "sim"
+# - Compose coi devices la BAT BUOC (khong co cu phap "optional device"),
+# thieu /dev/ttyUSB0 tren may se lam `docker compose up` fail cung ngay tu
+# luc tao container.
+#
+# Build NGAY TREN chinh thiet bi Pi/PC-bridge target (`docker compose up
+# --build`) - `build: .` trong docker-compose.yml build theo kien truc may
+# dang chay lenh nay. Neu doi sang build tap trung (CI/may dev) roi
+# push/transfer image sang Pi, PHAI dung `docker buildx build --platform
+# linux/arm64` (hoac linux/arm/v7) khop kien truc Pi that, khong build tran
+# tren may dev roi copy image sang - se loi "exec format error".
+services:
+  node-agent:
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+    group_add:
+      - "20"  # GID cua nhom "dialout" tren Debian/Ubuntu/Raspberry Pi OS
