@@ -37,5 +37,10 @@ class ChannelReader:
     def _run(self):
         raise NotImplementedError
 
-    def command(self, cmd: str, value=None) -> dict:
+    def command(self, cmd: str, value=None, channel: str = None) -> dict:
+        # `channel` (the id of the channel actually being controlled) only
+        # matters for a reader that represents MULTIPLE channels at once
+        # (e.g. ModbusReader Approach B: 1 physical source with several
+        # "points") - one-channel-one-device readers (sim/serial/mqtt/gpio)
+        # ignore this param and always use self.code.
         return {"ok": False, "error": "kenh %s khong ho tro lenh" % self.code}

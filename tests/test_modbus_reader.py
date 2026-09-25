@@ -545,7 +545,9 @@ def test_two_modbus_readers_same_rtu_port_share_one_client_no_exclusive_lock_con
 
 
 # ----------------------------------------------------------------------
-# 4) ModbusReader._read_once()
+# 4) ModbusReader._read_once() - contract Approach B: tra ve list [(code,
+#    value), ...] (1 phan tu khi KHONG dung "points", dung chinh reader.code
+#    lam code cua phan tu do - xem docstring _read_once() trong modbus.py)
 
 def _reader_with_fake_client(cfg_overrides=None, client=None):
     cfg = _tcp_cfg(**(cfg_overrides or {}))
@@ -565,7 +567,7 @@ def test_read_once_holding_register_decodes_and_applies_scale_offset():
     value = reader._read_once()
 
     reader._client.read_holding_registers.assert_called_once_with(10, count=1, device_id=3)
-    assert value == 100 * 2.0 + 5.0
+    assert value == [(reader.code, 100 * 2.0 + 5.0)]
 
 
 def test_read_once_input_register_calls_read_input_registers():
@@ -579,7 +581,7 @@ def test_read_once_input_register_calls_read_input_registers():
     value = reader._read_once()
 
     reader._client.read_input_registers.assert_called_once_with(20, count=1, device_id=1)
-    assert value == 42
+    assert value == [(reader.code, 42)]
 
 
 def test_read_once_32bit_dtype_reads_two_registers():
@@ -592,7 +594,7 @@ def test_read_once_32bit_dtype_reads_two_registers():
     value = reader._read_once()
 
     reader._client.read_holding_registers.assert_called_once_with(0, count=2, device_id=1)
-    assert value == 70000
+    assert value == [(reader.code, 70000)]
 
 
 def test_read_once_raises_io_error_when_response_is_error():
@@ -613,7 +615,7 @@ def test_read_once_default_scale_offset_is_identity():
     rr.registers = [77]
     reader._client.read_holding_registers.return_value = rr
 
-    assert reader._read_once() == 77
+    assert reader._read_once() == [(reader.code, 77)]
 
 
 # ----------------------------------------------------------------------
@@ -712,9 +714,13 @@ def test_run_emits_values_in_background_thread_then_stops_cleanly():
     reader = ModbusReader(_tcp_cfg(poll_ms=10), emit=fake_emit)
     fake_underlying = _fake_underlying_client(connected=True)
     shared = _SharedModbusClient(factory=lambda: fake_underlying)
+    # Contract Approach B: _read_once() tra ve LIST [(code, value)], khong
+    # con 1 float don - 1 phan tu duy nhat khi khong dung "points" (dung
+    # chinh reader.code).
+    single_point_values = [[(reader.code, v)] for v in (1.0, 2.0, 3.0, 4.0, 5.0)]
 
     with patch("node_agent.readers.modbus._get_shared_client", return_value=shared), \
-         patch.object(reader, "_read_once", side_effect=[1.0, 2.0, 3.0, 4.0, 5.0] * 50):
+         patch.object(reader, "_read_once", side_effect=single_point_values * 50):
         t = threading.Thread(target=reader._run, daemon=True)
         t.start()
         time.sleep(0.05)
@@ -775,6 +781,7 @@ def test_command_write_16bit_holding_register_success():
     reader = ModbusReader(_tcp_cfg(register_type="holding", data_type="u16",
                                     address=15, unit_id=2), emit=Mock())
     reader._client = MagicMock()
+    reader._client.write_register.return_value.isError.return_value = False
 
     result = reader.command("write", 123)
 
@@ -787,6 +794,7 @@ def test_command_write_32bit_holding_register_calls_write_registers():
     reader = ModbusReader(_tcp_cfg(register_type="holding", data_type="f32",
                                     address=20, unit_id=1), emit=Mock())
     reader._client = MagicMock()
+    reader._client.write_registers.return_value.isError.return_value = False
 
     result = reader.command("write", 3.5)
 
@@ -885,3 +893,273 @@ def test_command_write_catches_exception_from_client_and_returns_error_dict():
 
     assert result["ok"] is False
     assert "bus loi" in result["error"]
+
+
+def test_command_write_device_rejects_write_isError_response_returns_ok_false():
+    """Regression cho finding python-reviewer 2026-09-25: thiet bi tu choi
+    ghi (dia chi/ham khong hop le...) tra ve response BINH THUONG voi
+    isError()==True - KHONG raise exception. Bo qua check nay se bao ok=True
+    cho 1 lenh ghi thiet bi THAT SU tu choi, pha vo invariant dedup-theo-id
+    o agent.py::_command_loop (lenh bi coi la xong va khong bao gio duoc thu
+    lai du khong co gi thay doi tren thiet bi)."""
+    reader = ModbusReader(_tcp_cfg(register_type="holding", data_type="u16"), emit=Mock())
+    reader._client = MagicMock()
+    reader._client.write_register.return_value.isError.return_value = True
+    reader._client.write_register.return_value.__str__.return_value = "IllegalAddress"
+
+    result = reader.command("write", 5)
+
+    assert result["ok"] is False
+    assert "IllegalAddress" in result["error"]
+
+
+# ----------------------------------------------------------------------
+# 7) Approach B - "points" (nhieu diem do gop trong 1 request Modbus) - xem
+#    docstring dau file modbus.py va ModbusReader.__init__.
+
+def test_read_once_multipoint_decodes_each_point_from_combined_read():
+    """Regression truc tiep cho gia tri THAT do tren OrangePi3B (cam bien
+    nhiet-do-am RS485 CHI tra loi dung khi doc gop address=0 count=2, hoi
+    tung thanh ghi rieng se sai kieu response/timeout) - _read_once() phai
+    goi DUNG 1 request doc gop (count=2) roi decode moi diem tu vi tri
+    reg_offset rieng cua no trong khoi vua doc, KHONG duoc tach thanh N
+    request rieng cho N diem (day la diem cot loi cua Huong B, giam so
+    round-trip tren bus vat ly)."""
+    cfg = _tcp_cfg(points=[
+        {"code": "a", "reg_offset": 0, "data_type": "u16", "scale": 0.1, "offset": 0},
+        {"code": "b", "reg_offset": 1, "data_type": "u16", "scale": 0.1, "offset": 0},
+    ])
+    reader = ModbusReader(cfg, emit=Mock())
+    reader._client = MagicMock()
+    rr = MagicMock()
+    rr.isError.return_value = False
+    rr.registers = [259, 588]  # gia tri that (nhiet do 25.9, do am 58.8)
+    reader._client.read_holding_registers.return_value = rr
+
+    values = reader._read_once()
+
+    assert values == [("a", 25.9), ("b", 58.8)]
+    reader._client.read_holding_registers.assert_called_once_with(0, count=2, device_id=1)
+
+
+@pytest.mark.parametrize("points,expected_count", [
+    ([{"code": "a", "reg_offset": 0, "data_type": "u16"}], 1),
+    ([{"code": "a", "reg_offset": 0, "data_type": "u16"},
+      {"code": "b", "reg_offset": 1, "data_type": "u16"}], 2),
+    ([{"code": "a", "reg_offset": 0, "data_type": "u16"},
+      {"code": "b", "reg_offset": 1, "data_type": "f32"}], 3),
+    ([{"code": "a", "reg_offset": 0, "data_type": "u16"},
+      {"code": "b", "reg_offset": 2, "data_type": "f32"}], 4),
+])
+def test_count_computed_from_max_reg_offset_plus_width(points, expected_count):
+    """self._count phai la max(reg_offset+width) qua TAT CA point - du
+    16-bit (width=1) hay 32-bit (width=2), va du diem rong nhat KHONG phai
+    diem cuoi cung trong list."""
+    reader = ModbusReader(_tcp_cfg(points=points), emit=Mock())
+
+    assert reader._count == expected_count
+
+
+def test_points_backward_compat_no_points_key_behaves_as_single_point():
+    """KHONG co "points" trong cfg -> tuong thich nguoc 100% voi Phase 1:
+    self._points co dung 1 phan tu, code khop code cua chinh cfg, reg_offset
+    mac dinh 0 (doc dung tu self._address), va _read_once() van tra ve
+    [(code, value)] y het hanh vi truoc Huong B."""
+    cfg = _tcp_cfg(register_type="holding", data_type="u16", address=5, unit_id=2, scale=3.0, offset=1.0)
+    reader = ModbusReader(cfg, emit=Mock())
+
+    assert len(reader._points) == 1
+    assert reader._points[0]["code"] == cfg["code"]
+    assert reader._points[0]["reg_offset"] == 0
+
+    reader._client = MagicMock()
+    rr = MagicMock()
+    rr.isError.return_value = False
+    rr.registers = [10]
+    reader._client.read_holding_registers.return_value = rr
+
+    assert reader._read_once() == [(cfg["code"], 10 * 3.0 + 1.0)]
+
+
+def test_run_emits_each_point_separately_on_success():
+    """_run() chay THAT (thread that + join timeout, khong mock _read_once)
+    voi cau hinh multi-point - moi point phai duoc emit() DUNG code/value
+    rieng cua no, khong lan lon giua cac diem."""
+    emitted = []
+
+    def fake_emit(code, value, raw, quality, ok):
+        emitted.append((code, value, quality, ok))
+
+    cfg = _tcp_cfg(poll_ms=10, points=[
+        {"code": "a", "reg_offset": 0, "data_type": "u16", "scale": 0.1, "offset": 0},
+        {"code": "b", "reg_offset": 1, "data_type": "u16", "scale": 0.1, "offset": 0},
+    ])
+    reader = ModbusReader(cfg, emit=fake_emit)
+    fake_underlying = _fake_underlying_client(connected=True)
+    rr = MagicMock()
+    rr.isError.return_value = False
+    rr.registers = [259, 588]
+    fake_underlying.read_holding_registers.return_value = rr
+    shared = _SharedModbusClient(factory=lambda: fake_underlying)
+
+    with patch("node_agent.readers.modbus._get_shared_client", return_value=shared):
+        t = threading.Thread(target=reader._run, daemon=True)
+        t.start()
+        time.sleep(0.05)
+        reader._stop.set()
+        t.join(timeout=2)
+
+    assert not t.is_alive()
+    a_emits = [e for e in emitted if e[0] == "a"]
+    b_emits = [e for e in emitted if e[0] == "b"]
+    assert len(a_emits) >= 1
+    assert len(a_emits) == len(b_emits)          # cung so lan doc thanh cong cho ca 2 diem
+    assert all(v == 25.9 and q == 0 and ok is True for _, v, q, ok in a_emits)
+    assert all(v == 58.8 and q == 0 and ok is True for _, v, q, ok in b_emits)
+
+
+def test_run_emits_none_for_all_points_on_read_error():
+    """Loi doc gop (exception) -> emit(code, None, None, 2, False) phai duoc
+    goi cho TUNG point trong self._points, khong chi point dau."""
+    emitted = []
+
+    def fake_emit(code, value, raw, quality, ok):
+        emitted.append((code, value, quality, ok))
+
+    cfg = _tcp_cfg(poll_ms=10, points=[
+        {"code": "a", "reg_offset": 0, "data_type": "u16"},
+        {"code": "b", "reg_offset": 1, "data_type": "u16"},
+    ])
+    reader = ModbusReader(cfg, emit=fake_emit)
+    fake_underlying = _fake_underlying_client(connected=True)
+    shared = _SharedModbusClient(factory=lambda: fake_underlying)
+    ensure_calls = {"n": 0}
+    real_ensure_connected = shared.ensure_connected
+
+    def counting_ensure_connected():
+        ensure_calls["n"] += 1
+        if ensure_calls["n"] >= 2:
+            reader._stop.set()
+        return real_ensure_connected()
+
+    shared.ensure_connected = counting_ensure_connected
+
+    with patch("node_agent.readers.modbus._get_shared_client", return_value=shared), \
+         patch.object(reader, "_read_once", side_effect=IOError("loi doc modbus")), \
+         patch.object(reader._stop, "wait", return_value=False):
+        reader._run()
+
+    assert ("a", None, 2, False) in emitted
+    assert ("b", None, 2, False) in emitted
+
+
+def test_run_survives_emit_raising_exception_sets_error_and_keeps_retrying():
+    """Regression Critical (python-reviewer 2026-09-25): vong `for code, value
+    in values: self.emit(...)` TRUOC DAY nam NGOAI try/except boc _read_once()
+    - bat ky exception nao tu emit() se thoat thang khoi _run() (chi bi
+    finally release() client, khong duoc bat), giet thread reader VINH VIEN
+    va IM LANG (thread nay KHONG duoc Agent._guarded() bao ve, no la thread
+    rieng cua ChannelReader). Fix: dua vong emit() vao TRONG cung try - loi
+    tu emit() duoc xu ly y het loi doc (status.error, emit(None) bao loi cho
+    tung point, backoff, roi VAN TIEP TUC vong lap ke tiep, KHONG chet)."""
+    emitted = []
+    raised = {"n": 0}
+    error_seen = {"value": None}
+
+    def fake_emit(code, value, raw, quality, ok):
+        if ok and raised["n"] == 0:
+            raised["n"] += 1
+            raise RuntimeError("loi gia lap trong emit()")
+        if not ok:
+            # status.error da duoc set (boi except) NGAY TRUOC khi emit(...,
+            # ok=False) duoc goi cho tung point - chup lai tai day vi vong lap
+            # ngoai se RESET no ve None ngay khi ket noi lai thanh cong.
+            error_seen["value"] = reader.status.error
+        emitted.append((code, value, quality, ok))
+
+    reader = ModbusReader(_tcp_cfg(poll_ms=10), emit=fake_emit)
+    fake_underlying = _fake_underlying_client(connected=True)
+    rr = MagicMock()
+    rr.isError.return_value = False
+    rr.registers = [77]
+    fake_underlying.read_holding_registers.return_value = rr
+    shared = _SharedModbusClient(factory=lambda: fake_underlying)
+    wait_calls = {"n": 0}
+
+    def fake_wait(timeout=None):
+        # Khong sleep that (backoff toi thieu 1.0s) - chi dem lan goi va tu
+        # dung sau du vong lap de xac nhan reader TIEP TUC hoat dong sau loi
+        # emit(), khong can cho backoff that.
+        wait_calls["n"] += 1
+        if wait_calls["n"] >= 3:
+            reader._stop.set()
+        return False
+
+    with patch("node_agent.readers.modbus._get_shared_client", return_value=shared), \
+         patch.object(reader._stop, "wait", side_effect=fake_wait):
+        t = threading.Thread(target=reader._run, daemon=True)
+        t.start()
+        t.join(timeout=2)
+
+    assert not t.is_alive(), (
+        "thread reader van dang chay/da chet ngoai kiem soat sau khi emit() "
+        "raise - Critical finding (emit ngoai try) chua duoc fix dung")
+    assert raised["n"] == 1                          # emit() thuc su da raise dung 1 lan
+    assert error_seen["value"] is not None, (
+        "status.error KHONG duoc set truoc khi emit(ok=False) - chung to "
+        "exception tu emit() thoat thang khoi _run() ma KHONG duoc except nao bat")
+    assert "loi gia lap trong emit()" in error_seen["value"]
+    assert any(e[3] is False for e in emitted), "phai co it nhat 1 emit(..., ok=False) bao loi"
+    assert any(e[3] is True for e in emitted), (
+        "sau loi phai TIEP TUC vong lap va emit thanh cong lai duoc (thread khong chet)")
+
+
+def test_command_write_targets_correct_point_via_channel_param():
+    """command(..., channel="b") phai nham DUNG point "b" (reg_offset=1,
+    scale/offset rieng), KHONG phai point dau tien "a"."""
+    cfg = _tcp_cfg(register_type="holding", address=10, unit_id=1, points=[
+        {"code": "a", "reg_offset": 0, "data_type": "u16", "scale": 1.0, "offset": 0.0},
+        {"code": "b", "reg_offset": 1, "data_type": "u16", "scale": 2.0, "offset": 5.0},
+    ])
+    reader = ModbusReader(cfg, emit=Mock())
+    reader._client = MagicMock()
+    reader._client.write_register.return_value.isError.return_value = False
+
+    result = reader.command("write", 25.0, channel="b")  # raw = (25-5)/2 = 10
+
+    reader._client.write_register.assert_called_once_with(11, 10, device_id=1)  # address(10) + reg_offset(1)
+    assert result == {"ok": True, "status": "ok"}
+
+
+def test_command_write_unknown_channel_returns_error_not_default_point():
+    """channel khong ton tai trong self._points -> tra loi, KHONG duoc am
+    tham ghi vao point mac dinh (point dau tien)."""
+    cfg = _tcp_cfg(points=[
+        {"code": "a", "reg_offset": 0, "data_type": "u16"},
+        {"code": "b", "reg_offset": 1, "data_type": "u16"},
+    ])
+    reader = ModbusReader(cfg, emit=Mock())
+    reader._client = MagicMock()
+
+    result = reader.command("write", 30.0, channel="khong_ton_tai")
+
+    assert result["ok"] is False
+    reader._client.write_register.assert_not_called()
+    reader._client.write_registers.assert_not_called()
+
+
+def test_command_write_no_channel_defaults_to_first_point_backward_compat():
+    """Goi command() KHONG truyen channel (giong code cu goi truc tiep) ->
+    tuong thich nguoc, dung point dau tien (self._points[0])."""
+    cfg = _tcp_cfg(register_type="holding", address=10, unit_id=1, points=[
+        {"code": "a", "reg_offset": 0, "data_type": "u16", "scale": 1.0, "offset": 0.0},
+        {"code": "b", "reg_offset": 1, "data_type": "u16", "scale": 2.0, "offset": 5.0},
+    ])
+    reader = ModbusReader(cfg, emit=Mock())
+    reader._client = MagicMock()
+    reader._client.write_register.return_value.isError.return_value = False
+
+    result = reader.command("write", 42)  # KHONG truyen channel
+
+    reader._client.write_register.assert_called_once_with(10, 42, device_id=1)  # point dau (a): scale=1, offset=0
+    assert result == {"ok": True, "status": "ok"}

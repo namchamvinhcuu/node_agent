@@ -80,7 +80,7 @@ class SerialReader(ChannelReader):
                 stable = True
         self.emit(self.code, value, None, 0, stable)
 
-    def command(self, cmd: str, value=None) -> dict:
+    def command(self, cmd: str, value=None, channel: str = None) -> dict:
         raw = {"zero": self.cfg.get("cmd_zero"), "tare": self.cfg.get("cmd_tare"),
                "read": self.cfg.get("cmd_read")}.get(cmd)
         if not raw or not self._ser:

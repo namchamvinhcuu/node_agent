@@ -70,5 +70,20 @@
     "invert": false,
     "bounce_ms": 50,
     "poll_ms": 200
+  },
+  {
+    "code": "th_sensor",
+    "mode": "modbus",
+    "conn_type": "rtu",
+    "port": "/dev/ttyUSB2",
+    "baud": 9600,
+    "unit_id": 1,
+    "register_type": "holding",
+    "address": 0,
+    "poll_ms": 2000,
+    "points": [
+      {"code": "temp_rtu", "reg_offset": 0, "data_type": "u16", "scale": 0.1, "offset": 0},
+      {"code": "humi_rtu", "reg_offset": 1, "data_type": "u16", "scale": 0.1, "offset": 0}
+    ]
   }
 ]

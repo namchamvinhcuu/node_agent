@@ -62,7 +62,7 @@ class NodeAgent:
                 _logger.warning("kenh %s: mode '%s' khong ho tro", cfg.get("code"), mode)
                 continue
             try:
-                self._readers[cfg["code"]] = cls(cfg, self._emit)
+                reader = cls(cfg, self._emit)
             except Exception:                                       # noqa: BLE001
                 # settings_api.py validate pattern/tham so TRUOC khi ghi qua
                 # web UI, nhung channels.json van co the bi sua tay ngoai UI
@@ -72,11 +72,28 @@ class NodeAgent:
                 # day se crash ca process ngay luc khoi dong, ke ca cac kenh
                 # khac dang hoat dong binh thuong - xem python-reviewer 2026-09-25.
                 _logger.exception("kenh %s: khoi tao that bai, bo qua kenh nay", cfg.get("code"))
+                continue
+            # Approach B (ModbusReader "points"): 1 reader can represent
+            # MULTIPLE channel codes at once (1 physical source, several
+            # points read together in a single request) - map ALL of those
+            # codes to the SAME reader instance, so _command_loop routes
+            # commands to the right source and start()/stop() (using set()
+            # to dedupe by identity) doesn't spawn a duplicate thread for
+            # the same reader.
+            codes = [p["code"] for p in cfg["points"]] if cfg.get("points") else [cfg["code"]]
+            for code in codes:
+                self._readers[code] = reader
 
     # ------------------------------------------------------------------
     def start(self):
         self._build_readers()
-        for r in self._readers.values():
+        # set() dedupes by object identity (ChannelReader doesn't override
+        # __eq__/__hash__) - needed because an Approach B reader can appear
+        # MULTIPLE TIMES in self._readers.values() (once per channel code
+        # it represents); starting it twice would spawn 2 independent
+        # threads for the SAME reader object (sharing self._stop but
+        # calling _run() twice concurrently - unnecessary trouble).
+        for r in set(self._readers.values()):
             r.start()
         loops = [self._hello_loop, self._flush_loop, self._sender_loop,
                  self._heartbeat_loop, self._command_loop, self._setup_server_loop]
@@ -97,7 +114,7 @@ class NodeAgent:
 
     def stop(self):
         self._stop.set()
-        for r in self._readers.values():
+        for r in set(self._readers.values()):
             r.stop()
         for t in self._threads:
             t.join(timeout=5)
@@ -178,7 +195,7 @@ class NodeAgent:
                     self.client.ack_command(cmd_id, True, "")
                     continue
                 reader = self._readers.get(cmd["channel"])
-                result = (reader.command(cmd["cmd"], cmd.get("value")) if reader
+                result = (reader.command(cmd["cmd"], cmd.get("value"), channel=cmd["channel"]) if reader
                           else {"ok": False, "error": "khong co kenh %s tren node nay" % cmd["channel"]})
                 ok = result.get("ok", False)
                 if ok:

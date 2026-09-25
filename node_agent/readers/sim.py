@@ -33,5 +33,5 @@ class SimReader(ChannelReader):
             self.emit(self.code, round(v, 4), None, 0, True)
             self._stop.wait(self._poll_s)
 
-    def command(self, cmd: str, value=None) -> dict:
+    def command(self, cmd: str, value=None, channel: str = None) -> dict:
         return {"ok": True, "status": "ok"}

@@ -97,9 +97,29 @@ compose nua.
   qua bien tan) - input register la read-only theo dung chuan Modbus. Tu
   retry ket noi voi backoff (1s->30s) khi mat mang, KHONG die vinh vien nhu
   `serial` (thiet bi Modbus mang thuong gian doan tam thoi hon la loi vinh
-  vien). **Chua test voi thiet bi/PLC Modbus that** (khong co trong moi
-  truong phat trien) - chi verify bang mock + test ket noi that toi dia chi
-  khong ton tai (xac nhan tu retry dung, khong crash).
+  vien). **Da verify tren thiet bi that** (OrangePi3B + can dien tu qua
+  Modbus RTU, 2026-09-25).
+  - **Multiple readers on the same physical bus** (RTU): multiple
+    `ModbusReader` instances configured with the same `port`+`baud`
+    automatically share one connection (a single OS-level exclusive lock
+    on the serial port only allows one owner at a time - pymodbus opens
+    RTU ports with `exclusive=True` on purpose, to protect the
+    half-duplex bus from two clients writing/reading at once).
+  - **`points` (optional) — multiple values read together in ONE request**:
+    some cheap devices only answer a single fixed block read starting at
+    their base `address` and reject/mis-answer a request for a sub-range
+    (confirmed on real hardware: a combined temp+humidity RS485 sensor
+    answers `address=0 count=2` correctly but returns a malformed response
+    for `address=1` alone). Add `points: [{"code", "reg_offset", "data_type",
+    "scale", "offset"}, ...]` to a Modbus channel to read them all in one
+    request and emit each as its own channel code - `reg_offset` is the
+    position (in REGISTERS, not bytes) within the block, counted from the
+    channel's `address`. See `channels.example.json`'s `th_sensor` entry.
+    Without `points`, a channel behaves exactly as before (single value).
+    The Setup UI's Channels page has an "Add point to existing Modbus
+    source" form to attach a new point to an already-configured Modbus
+    channel (converting it to a multi-point source on first use) without
+    hand-editing `channels.json`.
 - `mode: "mqtt"` — subscribe DUNG 1 `topic` tren broker (`host`/`port`,
   `username`/`password` optional). Khac Modbus/serial (node CHU DONG poll),
   MQTT la PUSH-based: broker gui gia tri moi bat cu luc nao qua callback

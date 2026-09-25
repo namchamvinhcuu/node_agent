@@ -135,7 +135,7 @@ class MqttReader(ChannelReader):
         client.disconnect()
         self._client = None
 
-    def command(self, cmd: str, value=None) -> dict:
+    def command(self, cmd: str, value=None, channel: str = None) -> dict:
         # Kiem CA self._client CA status.online TRUOC khi publish, roi kiem
         # lai info.rc SAU khi publish - publish() cua paho KHONG raise khi mat
         # ket noi (QoS 0 mac dinh tra MQTT_ERR_NO_CONN va DROP message vinh

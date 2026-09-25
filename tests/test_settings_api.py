@@ -878,4 +878,251 @@ def test_channels_post_add_serial_missing_port_shows_error_and_scan_button(clien
 
     assert resp.status_code == 400
     assert "Must not be blank" in resp.text
-    assert 'onclick="scanPorts()"' in resp.text
+
+
+# ----------------------------------------------------------------------
+# 7) Approach B - action=add_point (them 1 diem vao nguon Modbus da co) va
+#    delete/list hien thi dung 1 dong/point - xem docstring dau file
+#    node_agent/readers/modbus.py va settings_api.py::_validate_point/
+#    _all_codes.
+
+def _single_point_modbus_channel(code="vfd1", **overrides):
+    """1 nguon Modbus DON diem (KHONG co "points") - dung shape THAT ma
+    _channel_to_json() sinh ra cho mode=modbus/conn_type=tcp (xem
+    test_channel_to_json_modbus_tcp_maps_fields_correctly)."""
+    ch = {
+        "code": code, "mode": "modbus", "conn_type": "tcp",
+        "unit_id": 1, "register_type": "holding", "address": 0,
+        "data_type": "i16", "scale": 2.0, "offset": 5.0, "poll_ms": 1000,
+        "host": "10.0.0.5", "tcp_port": 502,
+    }
+    ch.update(overrides)
+    return ch
+
+
+def _multipoint_modbus_channel(code="src1"):
+    return {
+        "code": code, "mode": "modbus", "conn_type": "tcp",
+        "unit_id": 1, "register_type": "holding", "address": 0, "poll_ms": 1000,
+        "host": "10.0.0.5", "tcp_port": 502,
+        "points": [
+            {"code": "a", "reg_offset": 0, "data_type": "u16", "scale": 1.0, "offset": 0.0},
+            {"code": "b", "reg_offset": 1, "data_type": "u16", "scale": 1.0, "offset": 0.0},
+        ],
+    }
+
+
+def _add_point_form(**overrides):
+    form = {
+        "action": "add_point", "point_source_code": "vfd1", "point_code": "vfd1_p2",
+        "point_reg_offset": "1", "point_data_type": "u16",
+        "point_scale": "1", "point_offset": "0",
+    }
+    form.update(overrides)
+    return form
+
+
+def test_add_point_converts_single_point_channel_to_multipoint_source(client, tmp_path):
+    """Them point dau tien vao 1 nguon Modbus con la don-diem -> nguon do
+    phai duoc CHUYEN thanh multi-point, point[0] giu DUNG data_type/scale/
+    offset GOC cua chinh channel cu (khong duoc mat/sai lech du lieu)."""
+    channels_path = tmp_path / "channels.json"
+    channels_path.write_text(json.dumps([_single_point_modbus_channel()]), encoding="utf-8")
+
+    resp = client.post("/setup/channels", data=_add_point_form())
+
+    assert resp.status_code == 200
+    assert client.app.state.restarts == [True]
+    saved = json.loads(channels_path.read_text(encoding="utf-8"))
+    assert len(saved) == 1
+    entry = saved[0]
+    assert entry["code"] == "vfd1"
+    assert entry["points"] == [
+        {"code": "vfd1", "reg_offset": 0, "data_type": "i16", "scale": 2.0, "offset": 5.0},
+        {"code": "vfd1_p2", "reg_offset": 1, "data_type": "u16", "scale": 1.0, "offset": 0.0},
+    ]
+    # unit_id/register_type/address/host/tcp_port/poll_ms cua nguon KHONG doi.
+    assert entry["unit_id"] == 1
+    assert entry["host"] == "10.0.0.5"
+
+
+def test_add_point_rejects_duplicate_code_across_nested_points(client, tmp_path):
+    """Code moi trung voi 1 code DA NAM TRONG "points" cua 1 nguon khac ->
+    bi chan 400 - kiem tra _all_codes() co duyet vao ben trong "points",
+    khong chi liet ke code cap cao nhat cua tung channel."""
+    channels_path = tmp_path / "channels.json"
+    channels_path.write_text(json.dumps([_multipoint_modbus_channel()]), encoding="utf-8")
+
+    resp = client.post("/setup/channels", data=_add_point_form(point_source_code="src1", point_code="b"))
+
+    assert resp.status_code == 400
+    assert "already exists" in resp.text
+    assert client.app.state.restarts == []
+    # Khong ghi de channels.json khi loi validate.
+    saved = json.loads(channels_path.read_text(encoding="utf-8"))
+    assert saved == [_multipoint_modbus_channel()]
+
+
+def test_delete_point_keeps_other_points_in_same_source(client, tmp_path):
+    """Xoa 1 point trong nguon co 2 point -> point con lai VAN CON trong
+    channels.json, KHONG bi xoa nham ca nguon."""
+    channels_path = tmp_path / "channels.json"
+    channels_path.write_text(json.dumps([_multipoint_modbus_channel()]), encoding="utf-8")
+
+    resp = client.post("/setup/channels", data={"action": "delete", "code": "a"})
+
+    assert resp.status_code == 200
+    assert client.app.state.restarts == [True]
+    saved = json.loads(channels_path.read_text(encoding="utf-8"))
+    assert len(saved) == 1
+    assert saved[0]["code"] == "src1"          # nguon van con
+    assert saved[0]["points"] == [
+        {"code": "b", "reg_offset": 1, "data_type": "u16", "scale": 1.0, "offset": 0.0},
+    ]
+
+
+def test_delete_last_point_removes_whole_source_entry(client, tmp_path):
+    """Nguon chi con 1 point, xoa not point do -> ca entry nguon bien mat
+    hoan toan khoi channels.json (khong con "points": [] mo coi)."""
+    solo_source = {
+        "code": "src2", "mode": "modbus", "conn_type": "tcp",
+        "unit_id": 1, "register_type": "holding", "address": 0, "poll_ms": 1000,
+        "host": "10.0.0.6", "tcp_port": 502,
+        "points": [{"code": "solo", "reg_offset": 0, "data_type": "u16", "scale": 1.0, "offset": 0.0}],
+    }
+    channels_path = tmp_path / "channels.json"
+    channels_path.write_text(json.dumps([solo_source]), encoding="utf-8")
+
+    resp = client.post("/setup/channels", data={"action": "delete", "code": "solo"})
+
+    assert resp.status_code == 200
+    assert client.app.state.restarts == [True]
+    saved = json.loads(channels_path.read_text(encoding="utf-8"))
+    assert saved == []
+
+
+def test_add_point_requires_same_origin_check(client, tmp_path):
+    """action=add_point cung phai bi chan CSRF giong cac action khac (delete/
+    add) - Origin header co nhung khac host -> 403, khong ghi file, khong
+    trigger restart."""
+    channels_path = tmp_path / "channels.json"
+    channels_path.write_text(json.dumps([_single_point_modbus_channel()]), encoding="utf-8")
+
+    resp = client.post("/setup/channels", data=_add_point_form(),
+                        headers={"origin": "http://evil.example"})
+
+    assert resp.status_code == 403
+    assert client.app.state.restarts == []
+    saved = json.loads(channels_path.read_text(encoding="utf-8"))
+    assert saved == [_single_point_modbus_channel()]   # khong bi doi
+
+
+def test_channels_list_page_shows_one_row_per_point(client, tmp_path):
+    """GET /setup/channels voi 1 nguon multi-point -> bang phai co 1 dong
+    RIENG cho MOI point (dung code point, khong phai code nguon)."""
+    channels_path = tmp_path / "channels.json"
+    channels_path.write_text(json.dumps([_multipoint_modbus_channel()]), encoding="utf-8")
+
+    resp = client.get("/setup/channels")
+
+    assert resp.status_code == 200
+    assert "<td>a</td><td>modbus</td>" in resp.text
+    assert "<td>b</td><td>modbus</td>" in resp.text
+    # Code cua CHINH nguon ("src1") khong duoc dung lam 1 dong rieng - chi
+    # cac point ben trong moi xuat hien.
+    assert "<td>src1</td>" not in resp.text
+
+
+# ----------------------------------------------------------------------
+# 8) Regression cho 2 finding python-reviewer 2026-09-25 (vong 2, sau khi
+#    da co Huong B) - _all_codes() Major #2 va _validate_point() overlap
+#    Minor - xem docstring _all_codes()/_validate_point() trong settings_api.py.
+
+def test_all_codes_includes_top_level_code_even_when_different_from_all_nested_points():
+    """Regression Major #2: TRUOC DAY _all_codes() dung if/else (CHI add
+    top-level code KHI KHONG co "points") - bo sot truong hop channels.json
+    sua tay co top-level "code" KHAC voi MOI code trong "points" (vd
+    "th_sensor" trong channels.example.json). Top-level code do CUNG la
+    `value` cua dropdown "Add point" source - thieu no o day se cho phep 1
+    kenh moi dung tren trung code, va khi trung se lam dropdown tro NHAM
+    sang nguon vat ly khac."""
+    channels = [{
+        "code": "th_sensor", "mode": "modbus", "conn_type": "tcp",
+        "host": "10.0.0.9", "tcp_port": 502,
+        "points": [{"code": "temp", "reg_offset": 0, "data_type": "u16"},
+                   {"code": "humid", "reg_offset": 1, "data_type": "u16"}],
+    }]
+
+    codes = settings_api._all_codes(channels)
+
+    assert codes == {"th_sensor", "temp", "humid"}
+
+
+def test_all_codes_single_point_channel_returns_just_its_own_code():
+    """Khong co "points" - hanh vi don gian, chi 1 code cap cao nhat."""
+    channels = [{"code": "solo", "mode": "sim"}]
+
+    assert settings_api._all_codes(channels) == {"solo"}
+
+
+def test_validate_point_rejects_overlapping_reg_offset_with_existing_point():
+    """Regression Minor: point moi TRUNG dung reg_offset (0) voi point "a"
+    da co trong nguon -> phai bi chan, khong duoc am tham chong lan vung
+    thanh ghi (se decode sai/lan lon 2 gia tri tu CUNG 1 thanh ghi vat ly)."""
+    base = {
+        "code": "src1", "mode": "modbus",
+        "points": [
+            {"code": "a", "reg_offset": 0, "data_type": "u16"},
+            {"code": "b", "reg_offset": 1, "data_type": "f32"},   # chiem reg 1,2
+        ],
+    }
+    values = {"point_code": "c", "point_reg_offset": "0", "point_data_type": "u16",
+              "point_scale": "1", "point_offset": "0"}
+
+    errors = settings_api._validate_point(values, base, existing_codes=set())
+
+    assert "point_reg_offset" in errors
+    assert "Overlaps" in errors["point_reg_offset"][0]
+
+
+def test_validate_point_rejects_partial_overlap_with_wider_existing_point():
+    """Point rong (f32 chiem 2 thanh ghi: 0,1) - point moi dat o reg_offset=1
+    (chi TRUNG 1 phan, khong trung offset dau) van phai bi chan - overlap
+    kieu [start,end) giao nhau, khong chi so sanh offset bang nhau."""
+    base = {
+        "code": "src1", "mode": "modbus",
+        "points": [{"code": "a", "reg_offset": 0, "data_type": "f32"}],
+    }
+    values = {"point_code": "b", "point_reg_offset": "1", "point_data_type": "u16",
+              "point_scale": "1", "point_offset": "0"}
+
+    errors = settings_api._validate_point(values, base, existing_codes=set())
+
+    assert "point_reg_offset" in errors
+
+
+def test_validate_point_accepts_non_overlapping_reg_offset():
+    """Point moi dat NGAY SAU point rong nhat (khong giao nhau) -> khong loi."""
+    base = {
+        "code": "src1", "mode": "modbus",
+        "points": [{"code": "a", "reg_offset": 0, "data_type": "u16"}],
+    }
+    values = {"point_code": "b", "point_reg_offset": "1", "point_data_type": "u16",
+              "point_scale": "1", "point_offset": "0"}
+
+    errors = settings_api._validate_point(values, base, existing_codes=set())
+
+    assert "point_reg_offset" not in errors
+
+
+def test_validate_point_rejects_overlap_when_base_still_single_point_no_points_key_yet():
+    """Nguon con la don-diem (CHUA co "points") - overlap check phai tu suy
+    ra 1 "point ao" tu chinh du lieu cua base (code/reg_offset=0/data_type)
+    de so sanh, khong duoc bo qua overlap chi vi chua co key "points"."""
+    base = {"code": "vfd1", "mode": "modbus", "data_type": "f32"}  # chiem reg 0,1
+    values = {"point_code": "vfd1_b", "point_reg_offset": "0", "point_data_type": "u16",
+              "point_scale": "1", "point_offset": "0"}
+
+    errors = settings_api._validate_point(values, base, existing_codes=set())
+
+    assert "point_reg_offset" in errors

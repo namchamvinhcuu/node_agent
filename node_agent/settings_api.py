@@ -38,6 +38,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .config import DOTENV_PATH, settings
+from .readers.modbus import _reg_width
 
 router = APIRouter()
 
@@ -297,6 +298,25 @@ def _load_channels() -> list:
     return settings.load_channels()
 
 
+def _all_codes(channels: list) -> set:
+    """Every channel code actually in use, including codes nested inside a
+    Modbus multi-point source's "points" list (Approach B) - a flat
+    {c.get("code") for c in channels} would miss those and let a duplicate
+    slip in. Always includes the entry's own top-level `code` too, even for
+    a multi-point source: hand-edited channels.json can leave it different
+    from every points[].code, and that top-level code is also the `value`
+    used by the "Add point" source dropdown - missing it here would let a
+    new channel silently collide with it, and a collision there would make
+    the dropdown resolve to the WRONG physical source (python-reviewer
+    2026-09-25 Major finding)."""
+    codes = set()
+    for c in channels:
+        codes.add(c.get("code"))
+        if c.get("mode") == "modbus" and c.get("points"):
+            codes.update(p.get("code") for p in c["points"])
+    return codes
+
+
 def _write_channels(channels: list) -> None:
     Path(settings.channels_file).write_text(
         json.dumps(channels, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -460,6 +480,62 @@ def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]
     return errors
 
 
+def _validate_point(values: dict, base, existing_codes: set) -> Dict[str, List[str]]:
+    """Validate a new point being added to an existing Modbus source
+    (Approach B - see readers/modbus.py). `base` is the matched source
+    entry from channels.json, or None if the selected source code wasn't
+    found."""
+    errors: Dict[str, List[str]] = {}
+
+    def add(key, msg):
+        errors.setdefault(key, []).append(msg)
+
+    if base is None:
+        add("point_source_code", "Source not found")
+    code = values.get("point_code", "").strip()
+    if not code:
+        add("point_code", "Must not be blank")
+    elif code in existing_codes:
+        add("point_code", "Channel code '%s' already exists" % code)
+    raw_offset = values.get("point_reg_offset", "").strip()
+    offset = None
+    try:
+        offset = int(raw_offset)
+        if offset < 0:
+            add("point_reg_offset", "Must be a non-negative integer")
+            offset = None
+    except ValueError:
+        add("point_reg_offset", "Must be an integer")
+    dtype = values.get("point_data_type")
+    if dtype not in ("u16", "i16", "u32", "i32", "f32"):
+        add("point_data_type", "Must be one of u16/i16/u32/i32/f32")
+        dtype = None
+    for key in ("point_scale", "point_offset"):
+        raw = values.get(key, "").strip()
+        if raw:
+            try:
+                float(raw)
+            except ValueError:
+                add(key, "Must be a number")
+    # A silently overlapping register range would decode two points from
+    # the SAME physical registers, corrupting the measurement pipeline
+    # without any error or warning anywhere - check it whenever we have
+    # enough valid info to compute the new point's [offset, offset+width)
+    # range (python-reviewer 2026-09-25 Minor finding).
+    if base is not None and offset is not None and dtype is not None:
+        new_width = _reg_width(dtype)
+        existing_points = base.get("points") or [
+            {"code": base.get("code"), "reg_offset": 0, "data_type": base.get("data_type", "u16")}]
+        for p in existing_points:
+            p_offset = p.get("reg_offset", 0)
+            p_width = _reg_width(p.get("data_type", "u16"))
+            if offset < p_offset + p_width and p_offset < offset + new_width:
+                add("point_reg_offset", "Overlaps with existing point '%s' (offset %s, width %s)" % (
+                    p.get("code"), p_offset, p_width))
+                break
+    return errors
+
+
 def _channel_to_json(values: dict) -> dict:
     if values["mode"] == "sim":
         return {
@@ -534,15 +610,17 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
     if "_form" in errors:
         banner = "".join('<div class="banner-err">%s</div>' % html.escape(e) for e in errors["_form"])
 
+    def _modbus_endpoint(ch: dict) -> str:
+        return (ch.get("host", "") + ":" + str(ch.get("tcp_port", "")) if ch.get("conn_type") == "tcp"
+                else ch.get("port", ""))
+
     def _channel_summary(ch: dict) -> str:
         mode = ch.get("mode")
         if mode == "serial":
             return ch.get("port", "")
         if mode == "modbus":
-            endpoint = ch.get("host", "") + ":" + str(ch.get("tcp_port", "")) \
-                if ch.get("conn_type") == "tcp" else ch.get("port", "")
             return "%s unit=%s reg=%s@%s" % (
-                endpoint, ch.get("unit_id"), ch.get("register_type"), ch.get("address"))
+                _modbus_endpoint(ch), ch.get("unit_id"), ch.get("register_type"), ch.get("address"))
         if mode == "mqtt":
             return "%s:%s topic=%s" % (ch.get("host", ""), ch.get("port", ""), ch.get("topic", ""))
         if mode == "gpio":
@@ -550,17 +628,31 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
                 ch.get("pin"), ch.get("pull_up"), ch.get("invert"))
         return "center=%s" % ch.get("center", "")
 
-    rows = ""
-    for ch in channels:
-        summary = _channel_summary(ch)
-        rows += (
+    def _channel_row(code: str, mode: str, detail: str) -> str:
+        return (
             "<tr><td>%s</td><td>%s</td><td>%s</td>"
             "<td><form method='post' action='/setup/channels' style='margin:0'>"
             "<input type='hidden' name='action' value='delete'>"
             "<input type='hidden' name='code' value='%s'>"
             "<button type='submit' class='danger'>Delete</button></form></td></tr>"
-        ) % (html.escape(ch.get("code", "")), html.escape(ch.get("mode", "")),
-             html.escape(str(summary)), html.escape(ch.get("code", "")))
+        ) % (html.escape(code), html.escape(mode), html.escape(detail), html.escape(code))
+
+    rows = ""
+    for ch in channels:
+        if ch.get("mode") == "modbus" and ch.get("points"):
+            # Approach B: a source may represent MULTIPLE real data channels
+            # (points) - list one row per point (each with its own delete
+            # button), not one row for the whole source, so Nam can remove
+            # a single point without losing the others sharing the same
+            # physical connection.
+            endpoint = _modbus_endpoint(ch)
+            for p in ch["points"]:
+                detail = "%s unit=%s reg=%s@%s+%s" % (
+                    endpoint, ch.get("unit_id"), ch.get("register_type"),
+                    ch.get("address"), p.get("reg_offset", 0))
+                rows += _channel_row(p.get("code", ""), "modbus", detail)
+        else:
+            rows += _channel_row(ch.get("code", ""), ch.get("mode", ""), _channel_summary(ch))
     table = ("<table><tr><th>Code</th><th>Mode</th><th>Detail</th><th></th></tr>%s</table>"
               % rows) if channels else "<p class='hint'>No channels yet.</p>"
 
@@ -652,6 +744,32 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
         + "</fieldset>"
         + "<button type='submit'>Add channel</button></form>"
     )
+
+    # Approach B: attach an additional point to an EXISTING Modbus source
+    # (same physical connection) instead of creating an independent one -
+    # needed for devices that only answer a single combined read (see
+    # readers/modbus.py). Source options are existing Modbus channel codes
+    # (works for both a plain single-point channel, which gets converted to
+    # a multi-point source on first use, and an already multi-point one).
+    modbus_source_codes = [c["code"] for c in channels if c.get("mode") == "modbus" and c.get("code")]
+    source_options = "".join(
+        '<option value="%s">%s</option>' % (html.escape(c), html.escape(c)) for c in modbus_source_codes
+    ) or '<option value="" disabled selected>No Modbus source yet</option>'
+    add_point_form = (
+        "<form method='post' action='/setup/channels'>"
+        "<input type='hidden' name='action' value='add_point'>"
+        "<fieldset><legend>Add point to existing Modbus source</legend>"
+        + ('<div class="field"><label>Source</label><select name="point_source_code">%s</select>%s</div>'
+           % (source_options, "".join('<p class="err">%s</p>' % html.escape(e)
+                                       for e in errors.get("point_source_code", []))))
+        + field("point_code", "New point code")
+        + field("point_reg_offset", "Register offset (from source's address)", "1")
+        + field("point_data_type", "Data type (u16/i16/u32/i32/f32)", "u16")
+        + field("point_scale", "Scale", "1")
+        + field("point_offset", "Offset", "0")
+        + "</fieldset>"
+        + "<button type='submit'>Add point</button></form>"
+    )
     scan_script = (
         "<script>"
         "async function scanPorts(){"
@@ -678,8 +796,9 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
         "<title>Node Agent Channels</title><style>%s</style></head><body>"
         "<div class='wrap'>%s<h1>Channels</h1>%s"
         "<div class='card'>%s</div>"
+        "<div class='card'>%s</div>"
         "<div class='card'>%s</div></div>%s</body></html>"
-    ) % (_CSS, _nav("channels"), banner, table, add_form, scan_script)
+    ) % (_CSS, _nav("channels"), banner, table, add_form, add_point_form, scan_script)
     return HTMLResponse(body)
 
 
@@ -727,8 +846,27 @@ async def channels_post(request: Request):
     channels = _load_channels()
     if action == "delete":
         code = form.get("code")
-        new_channels = [c for c in channels if c.get("code") != code]
-        if len(new_channels) == len(channels):
+        new_channels = []
+        changed = False
+        for c in channels:
+            if c.get("mode") == "modbus" and c.get("points"):
+                # Approach B: `code` may name a single point of a
+                # multi-point source rather than the source entry itself -
+                # remove just that point, dropping the whole entry only if
+                # it was the last point left.
+                kept = [p for p in c["points"] if p.get("code") != code]
+                if len(kept) == len(c["points"]):
+                    new_channels.append(c)
+                    continue
+                changed = True
+                if kept:
+                    c = dict(c, points=kept)
+                    new_channels.append(c)
+            elif c.get("code") == code:
+                changed = True
+            else:
+                new_channels.append(c)
+        if not changed:
             # Code khong ton tai - khong co gi thay doi, dung trigger restart
             # (xem _schedule_restart, DoS-guard 2026-09-25).
             return _render_channels(deleted=True)
@@ -752,11 +890,46 @@ async def channels_post(request: Request):
                    "offset", "modbus_poll_ms", "mqtt_host", "mqtt_port", "username",
                    "password", "topic", "json_key", "cmd_topic", "pin", "pull_up",
                    "invert", "bounce_ms", "gpio_poll_ms")}
-        existing_codes = {c.get("code") for c in channels}
-        errors = _validate_channel(values, existing_codes)
+        errors = _validate_channel(values, _all_codes(channels))
         if errors:
             return HTMLResponse(_render_channels(errors=errors).body, status_code=400)
         channels.append(_channel_to_json(values))
+        try:
+            _write_channels(channels)
+        except OSError as exc:
+            return HTMLResponse(
+                _render_channels(errors={"_form": ["Could not write channels.json: %s - check file write "
+                                                     "permission (remove `:ro` in docker-compose.yml "
+                                                     "if mounted read-only)" % exc]}).body,
+                status_code=500)
+        _schedule_restart()
+        return _render_channels(saved=True)
+    if action == "add_point":
+        values = {k: str(form.get(k, "")).strip() for k in
+                  ("point_source_code", "point_code", "point_reg_offset",
+                   "point_data_type", "point_scale", "point_offset")}
+        base = next((c for c in channels
+                     if c.get("mode") == "modbus" and c.get("code") == values["point_source_code"]), None)
+        errors = _validate_point(values, base, _all_codes(channels))
+        if errors:
+            return HTMLResponse(_render_channels(errors=errors).body, status_code=400)
+        if not base.get("points"):
+            # First point being added to a plain single-point Modbus
+            # channel - convert it into a multi-point source, preserving
+            # its own code/data_type/scale/offset as point index 0 so its
+            # existing data (and any pending command) keeps working.
+            base["points"] = [{
+                "code": base["code"], "reg_offset": 0,
+                "data_type": base.pop("data_type", "u16"),
+                "scale": base.pop("scale", 1), "offset": base.pop("offset", 0),
+            }]
+        base["points"].append({
+            "code": values["point_code"],
+            "reg_offset": int(values["point_reg_offset"]),
+            "data_type": values["point_data_type"],
+            "scale": float(values.get("point_scale") or 1),
+            "offset": float(values.get("point_offset") or 0),
+        })
         try:
             _write_channels(channels)
         except OSError as exc:

@@ -33,8 +33,20 @@ CUOI CUNG dung no dừng. `_io_lock` bat buoc rieng voi refcount: RTU la
 half-duplex du co share client hay khong - 2 thread goi read/write dong
 thoi van chong khung tren day vat ly that, GIL Python khong bao ve duoc
 chuyen nay (day la gioi han giao thuc serial, khong phai gioi han ngon
-ngu). No dang de lai (het no vao Phase sau, xem Plan) - gop nhieu diem do
-lien ke thanh 1 request `count=N` de giam so round-trip tren bus."""
+ngu).
+
+APPROACH B (2026-09-25, built right after Approach A was deployed for
+real): 1 Modbus "source" can now have MULTIPLE points ("points" in
+channels.json) read in a SINGLE combined request - needed because of a
+REAL finding on OrangePi3B: a cheap RS485 temp+humidity sensor only
+answers correctly when reading address=0 count=2 (temperature + humidity
+together in one request); asking for a single register alone (e.g.
+address=1) returns the WRONG response type (`ReadCoilsResponse` instead
+of `ReadHoldingRegistersResponse`) or times out entirely - this class of
+cheap firmware doesn't accept a sub-range read starting mid-block, only
+the one fixed block from the base address. `points` is OPTIONAL - when
+absent, behavior is 100% backward compatible with Phase 1 (treated as a
+single point using this same cfg)."""
 import logging
 import struct
 import threading
@@ -160,6 +172,28 @@ def _decode(regs, dtype: str):
     return regs[0]
 
 
+def _reg_width(dtype: str) -> int:
+    return 1 if (dtype or "u16").lower() in ("i16", "u16") else 2
+
+
+def _parse_point(p: dict) -> dict:
+    """1 point read as part of a combined multi-value read (Approach B) -
+    e.g. an RS485 temp+humidity sensor only answers correctly when reading
+    address=0 count=2 in a single request (confirmed on real hardware,
+    OrangePi3B, 2026-09-25: asking for address=1 alone returns the wrong
+    response type / times out). `reg_offset` is the position (in REGISTERS,
+    not bytes) within the read block, relative to the source's `address`."""
+    dtype = (p.get("data_type") or "u16").lower()
+    return {
+        "code": p["code"],
+        "reg_offset": int(p.get("reg_offset", 0)),
+        "data_type": dtype,
+        "scale": float(p.get("scale", 1) or 1),
+        "offset": float(p.get("offset", 0) or 0),
+        "width": _reg_width(dtype),
+    }
+
+
 def _encode(dtype: str, value: float):
     # round() (KHONG phai int()/truncate) truoc khi ep kieu nguyen - sai so
     # dau phay dong khi tinh raw = (value - offset) / scale (command("write"))
@@ -189,11 +223,22 @@ class ModbusReader(ChannelReader):
         super().__init__(cfg, emit)
         self._client = None
         self._unit = int(cfg.get("unit_id", 1) or 1)
-        self._dtype = (cfg.get("data_type") or "u16").lower()
         self._address = int(cfg.get("address", 0))
         self._register_type = cfg.get("register_type", "holding")
-        self._scale = float(cfg.get("scale", 1) or 1)
-        self._offset = float(cfg.get("offset", 0) or 0)
+        # Approach B (2026-09-25): a Modbus source can now have MULTIPLE
+        # points ("points" in channels.json), read together in a single
+        # request - confirmed on real hardware (OrangePi3B): an RS485
+        # temp+humidity sensor only answers correctly when reading
+        # address=0 count=2 (temperature + humidity together), rejecting/
+        # mis-answering a request for a single register alone (see
+        # Plan/node-agent-multi-protocol-readers.md). No "points" -> 100%
+        # backward compatible with the old (Phase 1) config: treated as a
+        # single point using this same cfg (reg_offset=0 by default, so it
+        # reads exactly from `address`, code matches self.code) - output
+        # values are unchanged from before Approach B.
+        points_cfg = cfg.get("points") or [cfg]
+        self._points = [_parse_point(p) for p in points_cfg]
+        self._count = max(p["reg_offset"] + p["width"] for p in self._points)
         # Ep kieu NGAY o __init__ (duoc agent.py::_build_readers() boc
         # try/except) thay vi doc lai tu self.cfg trong _run() - _run() chay
         # tren thread TRAN khong duoc Agent._guarded() bao ve, channels.json
@@ -219,15 +264,25 @@ class ModbusReader(ChannelReader):
             self._client_factory = lambda: ModbusSerialClient(port, baudrate=baud)
 
     def _read_once(self):
-        count = 1 if self._dtype in ("i16", "u16") else 2
+        """Read once, combining enough registers for ALL points
+        (self._count) in a single request, then decode each point from its
+        own position (`reg_offset`) within the block just read - returns a
+        list of (code, value) for EVERY point (just 1 element when not
+        using "points", preserving the old behavior). Only 1 request per
+        loop iteration whether there's 1 or N points - fewer round-trips on
+        the physical bus."""
         if self._register_type == "input":
-            rr = self._client.read_input_registers(self._address, count=count, device_id=self._unit)
+            rr = self._client.read_input_registers(self._address, count=self._count, device_id=self._unit)
         else:
-            rr = self._client.read_holding_registers(self._address, count=count, device_id=self._unit)
+            rr = self._client.read_holding_registers(self._address, count=self._count, device_id=self._unit)
         if rr.isError():
             raise IOError(str(rr))
-        raw = _decode(rr.registers, self._dtype)
-        return raw * self._scale + self._offset
+        results = []
+        for p in self._points:
+            regs = rr.registers[p["reg_offset"]:p["reg_offset"] + p["width"]]
+            raw = _decode(regs, p["data_type"])
+            results.append((p["code"], round(raw * p["scale"] + p["offset"], 6)))
+        return results
 
     def _run(self):
         self._client = _get_shared_client(self._client_key, self._client_factory)
@@ -257,8 +312,9 @@ class ModbusReader(ChannelReader):
                 self.status.error = None
                 while not self._stop.is_set():
                     try:
-                        value = self._read_once()
-                        self.emit(self.code, round(value, 6), None, 0, True)
+                        values = self._read_once()
+                        for code, value in values:
+                            self.emit(code, value, None, 0, True)
                     except Exception as exc:                        # noqa: BLE001
                         # KHONG reset backoff o day - thiet bi TON TAI nhung doc
                         # LUON loi (sai address/register_type/unit_id, hoac PLC
@@ -271,10 +327,17 @@ class ModbusReader(ChannelReader):
                         # reader khac dung chung, dong se ngat ca cac reader do;
                         # ensure_connected() o vong lap ngoai se tu phat hien va
                         # reconnect neu that su mat ket noi (is_socket_open()).
+                        # The emit loop above is INSIDE this try on purpose
+                        # (python-reviewer 2026-09-25 Critical finding): any
+                        # exception raised while emitting must be caught the
+                        # same way as a read error - this reader thread is
+                        # NOT protected by Agent._guarded(), so letting it
+                        # escape would kill the thread silently forever.
                         self.status.error = str(exc)[:200]
                         _logger.warning("kenh %s: loi doc modbus, thu lai sau %.1fs: %s",
                                          self.code, backoff, exc)
-                        self.emit(self.code, None, None, 2, False)
+                        for p in self._points:
+                            self.emit(p["code"], None, None, 2, False)
                         self._stop.wait(backoff)
                         backoff = min(backoff * 2, _BACKOFF_MAX_S)
                         break
@@ -286,20 +349,42 @@ class ModbusReader(ChannelReader):
             self._client.release()
             self._client = None
 
-    def command(self, cmd: str, value=None) -> dict:
+    def command(self, cmd: str, value=None, channel: str = None) -> dict:
         if cmd != "write" or value is None:
             return {"ok": False, "error": "modbus chi ho tro cmd=write kem value"}
         if self._register_type == "input":
             return {"ok": False, "error": "input register la read-only, khong ghi duoc"}
+        # A source can have MULTIPLE points (Approach B) - `channel`
+        # (passed down by agent.py from the real command's target channel
+        # id) identifies the RIGHT point to write to (each point has its
+        # own scale/offset/address). No `channel` given (e.g. old direct
+        # calls, or a single-point source) -> defaults to the FIRST point,
+        # preserving behavior from before Approach B.
+        point = self._points[0]
+        if channel is not None:
+            point = next((p for p in self._points if p["code"] == channel), None)
+            if point is None:
+                return {"ok": False, "error": "kenh %s khong thuoc nguon modbus nay" % channel}
         if not self._client:
             return {"ok": False, "error": "chua ket noi toi thiet bi"}
         try:
-            raw = (float(value) - self._offset) / self._scale
-            regs = _encode(self._dtype, raw)
+            raw = (float(value) - point["offset"]) / point["scale"]
+            regs = _encode(point["data_type"], raw)
+            address = self._address + point["reg_offset"]
             if len(regs) == 1:
-                self._client.write_register(self._address, regs[0], device_id=self._unit)
+                resp = self._client.write_register(address, regs[0], device_id=self._unit)
             else:
-                self._client.write_registers(self._address, regs, device_id=self._unit)
+                resp = self._client.write_registers(address, regs, device_id=self._unit)
+            # A device rejecting the write (illegal address/function...)
+            # comes back as a normal response with isError()==True - it does
+            # NOT raise (verified against real pymodbus source, same as
+            # _read_once() already has to check). Missing this check would
+            # report ok=True for a write the device actually refused,
+            # breaking the dedup-by-id invariant in agent.py::_command_loop
+            # (the command is marked done and never retried even though
+            # nothing changed on the device) - python-reviewer 2026-09-25.
+            if resp.isError():
+                return {"ok": False, "error": str(resp)}
             return {"ok": True, "status": "ok"}
         except Exception as exc:                                    # noqa: BLE001
             return {"ok": False, "error": str(exc)[:200]}
