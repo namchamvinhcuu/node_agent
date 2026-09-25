@@ -269,7 +269,7 @@ def test_validate_channel_rejects_invalid_regex_pattern():
     }
     errors = settings_api._validate_channel(values, existing_codes=set())
     assert "pattern" in errors
-    assert "Regex khong hop le" in errors["pattern"][0]
+    assert "Invalid regex" in errors["pattern"][0]
 
 
 @pytest.mark.parametrize("key", ["value_group", "stop_bits", "stable_group"])
@@ -462,7 +462,7 @@ def test_post_setup_identical_values_does_not_trigger_restart(client):
     second = client.post("/setup", data=form)
 
     assert second.status_code == 200
-    assert "Da luu" in second.text
+    assert "Saved" in second.text
     assert client.app.state.restarts == [True]  # khong them lan restart nao
 
 
@@ -496,7 +496,7 @@ def test_channels_post_add_returns_500_with_clear_banner_when_write_fails(client
     resp = client.post("/setup/channels", data=_valid_sim_channel_form(code="new_ch"))
 
     assert resp.status_code == 500
-    assert "Khong ghi duoc channels.json" in resp.text
+    assert "Could not write channels.json" in resp.text
     assert "Traceback" not in resp.text
     assert client.app.state.restarts == []
 
@@ -518,7 +518,7 @@ def test_channels_post_delete_returns_500_with_clear_banner_when_write_fails(cli
     resp = client.post("/setup/channels", data={"action": "delete", "code": "scale_wt"})
 
     assert resp.status_code == 500
-    assert "Khong ghi duoc channels.json" in resp.text
+    assert "Could not write channels.json" in resp.text
     assert client.app.state.restarts == []
 
 
@@ -658,3 +658,89 @@ def test_load_dotenv_default_override_false_would_reproduce_stale_bug(tmp_path, 
     load_dotenv(env_path)  # override=False mac dinh
 
     assert os.environ["NODE_HELLO_INTERVAL_S"] == "999"  # gia tri CU bi ket, dung bug da gap
+
+
+# ----------------------------------------------------------------------
+# 8) _scan_serial_ports / GET /setup/channels/scan_ports
+
+def test_scan_serial_ports_finds_matching_dev_nodes(monkeypatch):
+    """Goi dung ham that _scan_serial_ports(), chi mock glob.glob (khong
+    dung /dev that cua may chay test) - tra file gia theo dung 3 pattern ham
+    dang quet, xac nhan gop + sap xep dung, khong trung lap."""
+    fake = {
+        "/dev/ttyUSB*": ["/dev/ttyUSB0"],
+        "/dev/ttyACM*": ["/dev/ttyACM0", "/dev/ttyACM0"],  # trung lap co y - phai bi loai qua set()
+        "/dev/ttyAMA*": [],
+    }
+    monkeypatch.setattr(settings_api.glob, "glob", lambda pat: fake.get(pat, []))
+
+    result = settings_api._scan_serial_ports()
+
+    assert result == ["/dev/ttyACM0", "/dev/ttyUSB0"]
+
+
+def test_scan_serial_ports_empty_when_no_device(monkeypatch):
+    monkeypatch.setattr(settings_api.glob, "glob", lambda pat: [])
+
+    assert settings_api._scan_serial_ports() == []
+
+
+def test_get_scan_ports_returns_200_json_list(client, monkeypatch):
+    monkeypatch.setattr(settings_api, "_scan_serial_ports", lambda: ["/dev/ttyUSB0", "/dev/ttyACM0"])
+
+    resp = client.get("/setup/channels/scan_ports")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ports": ["/dev/ttyUSB0", "/dev/ttyACM0"]}
+
+
+def test_get_scan_ports_requires_auth_when_token_set(client, monkeypatch):
+    monkeypatch.setattr(settings, "setup_token", "s3cr3t")
+
+    resp = client.get("/setup/channels/scan_ports")
+
+    assert resp.status_code == 401
+
+
+def test_root_redirects_to_setup(client):
+    resp = client.get("/", follow_redirects=False)
+
+    assert resp.status_code in (302, 307)
+    assert resp.headers["location"] == "/setup"
+
+
+def test_port_field_html_no_error_still_renders_scan_button_and_input(monkeypatch):
+    """errors=={} (truong hop GET /setup/channels binh thuong, chua submit
+    gi) - phai co input + nut Scan, KHONG co the <p class="err">."""
+    out = settings_api._port_field_html({})
+
+    assert 'onclick="scanPorts()"' in out
+    assert 'id="port-input"' in out
+    assert 'class="err"' not in out
+
+
+def test_port_field_html_renders_error_message_when_present():
+    out = settings_api._port_field_html({"port": ["Khong duoc de trong"]})
+
+    assert '<p class="err">Khong duoc de trong</p>' in out
+    # Loi khac (vd baud) khong duoc lan sang field port.
+    assert out.count('class="err"') == 1
+
+
+def test_channels_post_add_serial_missing_port_shows_error_and_scan_button(client):
+    """Tich hop that qua HTTP: POST /setup/channels thieu port -> _render_channels
+    phai di qua _port_field_html(errors) va hien dung loi (khong phai field()
+    generic cu, vi field port da doi sang scan-button UI)."""
+    form = {
+        "action": "add", "code": "scale_wt", "mode": "serial",
+        "poll_ms": "", "center": "", "spread": "",
+        "port": "", "baud": "9600", "data_bits": "8", "parity": "none", "stop_bits": "1",
+        "terminator": "", "pattern": "^x$", "value_group": "1",
+        "stable_group": "", "stable_ok": "", "cmd_zero": "", "cmd_tare": "",
+    }
+
+    resp = client.post("/setup/channels", data=form)
+
+    assert resp.status_code == 400
+    assert "Must not be blank" in resp.text
+    assert 'onclick="scanPorts()"' in resp.text
