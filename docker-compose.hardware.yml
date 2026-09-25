@@ -24,6 +24,26 @@
 # rong nay (2026-09-25) sau khi can nhac voi phuong an hep hon
 # (device_cgroup_rules theo major number) - xem Plan/node-agent-setup-web-ui.md.
 #
+# `device_cgroup_rules` BAT BUOC rieng, KHONG the thay the boi volumes+group_add
+# o tren - da verify thuc nghiem tren OrangePi3B that (2026-09-25, cgroup v2):
+# bind-mount /dev:/dev CHI lam device node hien ra trong filesystem namespace
+# cua container, nhung Docker van ap dung mot LOP KHAC doc lap - cgroup device
+# controller - chan open() cac major/minor KHONG nam trong whitelist mac dinh
+# (null/zero/tty/ptmx...) BAT KE quyen file Unix (owner/group/mode) co dung
+# hay khong. Trieu chung: pyserial raise "SerialException [Errno 1] could not
+# open port ...: Operation not permitted" ngay ca khi `ls -la`/`getfacl` tren
+# ca host lan container deu cho thay quyen dialout dung. Truoc day trieu
+# chung nay bi gan nham cho loi driver PL2303 stall o tang kernel (xem muc
+# "Known issue" trong Deploy-Runbook.md) - lan nay dmesg KHONG co dong
+# `pl2303_get_line_request failed`, xac nhan day la 2 nguyen nhan KHAC NHAU
+# cung ra 1 trieu chung EPERM giong het nhau, de nham lan neu chi doc dmesg
+# so luot. `c 188:* rmw` = major 188 la ma LANANA gan cho "USB serial
+# converters" (dung chung cho pl2303/ch340/ch341/ftdi_sio/cp210x... - MOI
+# driver usbserial deu dang ky duoi major nay voi minor dong), wildcard `*`
+# cho phep TAT CA minor duoi major do - giu dung tinh than "cam cong nao
+# cung duoc, chon qua channels.json" ma khong can biet truoc device node cu
+# the (khac han neu dung `devices:` liet ke tung path).
+#
 # Build NGAY TREN chinh thiet bi Pi/PC-bridge target (`docker compose up
 # --build`) - `build: .` trong docker-compose.yml build theo kien truc may
 # dang chay lenh nay. Neu doi sang build tap trung (CI/may dev) roi
@@ -36,3 +56,5 @@ services:
       - /dev:/dev
     group_add:
       - "20"  # GID cua nhom "dialout" tren Debian/Ubuntu/Raspberry Pi OS
+    device_cgroup_rules:
+      - "c 188:* rmw"  # major USB-serial converter - xem giai thich tren
