@@ -56,13 +56,13 @@ def _encode(dtype: str, value: float):
     # khong phai regression rieng cua file nay).
     dtype = (dtype or "u16").lower()
     if dtype in ("i16", "u16"):
-        return [int(value) & 0xFFFF]
+        return [round(value) & 0xFFFF]
     if dtype == "f32":
         raw = struct.pack(">f", float(value))
     elif dtype == "i32":
-        raw = struct.pack(">i", int(value))
+        raw = struct.pack(">i", round(value))
     else:
-        raw = struct.pack(">I", int(value) & 0xFFFFFFFF)
+        raw = struct.pack(">I", round(value) & 0xFFFFFFFF)
     hi, lo = struct.unpack(">HH", raw)
     return [hi, lo]
 
