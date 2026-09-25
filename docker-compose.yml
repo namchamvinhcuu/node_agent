@@ -5,10 +5,21 @@ services:
     container_name: node-agent
     restart: always
     stop_grace_period: 30s
-    env_file:
-      - .env
+    ports:
+      - "${NODE_SETUP_PORT:-8091}:${NODE_SETUP_PORT:-8091}"
     volumes:
-      - ./channels.json:/app/channels.json:ro
+      # Bind-mount THAT (KHONG dung `env_file:`) - `env_file:` chi inject
+      # bien moi truong 1 LAN luc container duoc TAO, khong mount file. Neu
+      # dung env_file, Save qua web UI (/setup) se ghi vao MOT file .env
+      # khac hoan toan ben trong container (khong lien quan gi toi file .env
+      # tren host), va os.environ da co san tu luc container tao se KHONG
+      # bao gio bi ghi de boi lan load_dotenv() tiep theo (load_dotenv mac
+      # dinh override=False) - Save "thanh cong" nhung KHONG BAO GIO co hieu
+      # luc that, mai mai, ke ca sau restart. Copy dung pattern
+      # ../edge_collector/docker-compose.yml:26 (da giai quyet dung bai toan
+      # nay) - xem review 2026-09-25.
+      - ./.env:/app/.env
+      - ./channels.json:/app/channels.json
       - node-agent-var:/app/var
     deploy:
       resources:

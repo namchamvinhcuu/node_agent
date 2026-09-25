@@ -3,9 +3,26 @@
 #   docker compose -f docker-compose.yml -f docker-compose.hardware.yml up
 #
 # KHONG include file nay khi test/dev bang channels.json toan "mode": "sim"
-# - Compose coi devices la BAT BUOC (khong co cu phap "optional device"),
-# thieu /dev/ttyUSB0 tren may se lam `docker compose up` fail cung ngay tu
-# luc tao container.
+# - se khong can hardware gi.
+#
+# Bind-mount CA THU MUC /dev (KHONG liet ke tung `/dev/ttyUSB0` rieng le):
+# Compose khong co cu phap "optional device" - neu liet ke cung 1 path co
+# dinh, cam cong USB khac (hoac chi co 1 trong nhieu path liet ke) se lam
+# `docker compose up` fail CUNG ngay tu luc tao container (da gap that voi
+# cach lam cu, xem Fix-History). Bind-mount thu muc thay vi device node cu
+# the giai quyet triet de: node_agent khong can biet TRUOC cong nao se duoc
+# cam vao - chi can chon dung `port` trong channels.json (qua web UI /setup/
+# channels) la dung, ke ca cam SAU khi container da start (device node cu
+# the trong `devices:` chi chup nhanh luc tao container, bind-mount thu muc
+# thi thay thay doi ngay).
+#
+# Container van chay non-root (uid 1000, xem Dockerfile) + group_add "20"
+# (dialout) - CHI doc/ghi duoc file co quyen nhom dialout (serial/tty), KHONG
+# tu nhien truy cap duoc disk/GPU/thiet bi khac trong /dev du thay duong dan
+# (permission Linux van ap dung binh thuong, bind-mount chi anh xa namespace
+# duong dan, khong doi ownership/mode cua tung file). Nam da duyet mount
+# rong nay (2026-09-25) sau khi can nhac voi phuong an hep hon
+# (device_cgroup_rules theo major number) - xem Plan/node-agent-setup-web-ui.md.
 #
 # Build NGAY TREN chinh thiet bi Pi/PC-bridge target (`docker compose up
 # --build`) - `build: .` trong docker-compose.yml build theo kien truc may
@@ -15,7 +32,7 @@
 # tren may dev roi copy image sang - se loi "exec format error".
 services:
   node-agent:
-    devices:
-      - /dev/ttyUSB0:/dev/ttyUSB0
+    volumes:
+      - /dev:/dev
     group_add:
       - "20"  # GID cua nhom "dialout" tren Debian/Ubuntu/Raspberry Pi OS

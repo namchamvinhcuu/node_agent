@@ -4,9 +4,18 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
-load_dotenv()
+# Duong dan .env CHIA SE voi settings_api.py (trang /setup) - phai cung MOT
+# cach resolve, khong de moi noi tu doan lay path rieng (se lech nhau tuy CWD
+# luc start process) - xem review 2026-09-25 (Docker env_file: chi inject
+# 1 lan luc container CREATE, KHONG mount file; .env phai duoc BIND-MOUNT +
+# load_dotenv(DOTENV_PATH, override=True) moi thay doi tu web UI co hieu luc
+# that qua lan restart tiep theo - xem docker-compose.yml). Copy pattern tu
+# ../edge_collector/edge_collector/config.py (da giai quyet dung bai toan nay).
+DOTENV_PATH = Path(find_dotenv(usecwd=True) or (Path(__file__).resolve().parent.parent / ".env"))
+
+load_dotenv(DOTENV_PATH, override=True)
 
 
 def _int(name, default):
@@ -29,6 +38,9 @@ class Settings:
     heartbeat_interval_s: int = _int("NODE_HEARTBEAT_INTERVAL_S", 30)
     submit_interval_s: float = float(os.environ.get("NODE_SUBMIT_INTERVAL_S", "2"))
     command_poll_interval_s: float = float(os.environ.get("NODE_COMMAND_POLL_INTERVAL_S", "2"))
+
+    setup_port: int = _int("NODE_SETUP_PORT", 8091)
+    setup_token: str = os.environ.get("NODE_SETUP_TOKEN", "")
 
     def __post_init__(self):
         self.state_dir = Path(self.state_dir)

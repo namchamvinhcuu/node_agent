@@ -16,6 +16,7 @@ from .config import settings
 from .edge_client import EdgeClient
 from .readers.serial_ascii import SerialReader
 from .readers.sim import SimReader
+from .settings_api import router as settings_router
 from .store import Store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -56,7 +57,17 @@ class NodeAgent:
             if not cls:
                 _logger.warning("kenh %s: mode '%s' khong ho tro", cfg.get("code"), mode)
                 continue
-            self._readers[cfg["code"]] = cls(cfg, self._emit)
+            try:
+                self._readers[cfg["code"]] = cls(cfg, self._emit)
+            except Exception:                                       # noqa: BLE001
+                # settings_api.py validate pattern/tham so TRUOC khi ghi qua
+                # web UI, nhung channels.json van co the bi sua tay ngoai UI
+                # (SSH, edit truc tiep) - 1 kenh cau hinh sai (vd regex loi
+                # neu bo qua validate) KHONG duoc phep keo sap toan bo node,
+                # vi __init__ chay dong bo o day (ngoai _guarded()) - loi TRUOC
+                # day se crash ca process ngay luc khoi dong, ke ca cac kenh
+                # khac dang hoat dong binh thuong - xem python-reviewer 2026-09-25.
+                _logger.exception("kenh %s: khoi tao that bai, bo qua kenh nay", cfg.get("code"))
 
     # ------------------------------------------------------------------
     def start(self):
@@ -64,7 +75,7 @@ class NodeAgent:
         for r in self._readers.values():
             r.start()
         loops = [self._hello_loop, self._flush_loop, self._sender_loop,
-                 self._heartbeat_loop, self._command_loop]
+                 self._heartbeat_loop, self._command_loop, self._setup_server_loop]
         for fn in loops:
             t = threading.Thread(target=self._guarded, args=(fn,), name=fn.__name__, daemon=True)
             t.start()
@@ -171,3 +182,23 @@ class NodeAgent:
                 self.client.ack_command(cmd_id, ok, result.get("error") or "")
                 continue          # kiem tra ngay lenh ke tiep, khong cho
             self._stop.wait(settings.command_poll_interval_s)
+
+    def _setup_server_loop(self):
+        # uvicorn tu quan ly asyncio loop rieng trong thread nay - phan con
+        # lai cua node_agent van la stdlib threading thuan, KHONG dung chung
+        # event loop. Watcher thread set should_exit khi self._stop bat, de
+        # server.run() (blocking) tra ve thay vi cho SIGTERM/join timeout 5s.
+        import uvicorn
+        from fastapi import FastAPI
+
+        app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+        app.include_router(settings_router)
+        server = uvicorn.Server(uvicorn.Config(
+            app, host="0.0.0.0", port=settings.setup_port, log_level="warning"))
+
+        def _watch_stop():
+            self._stop.wait()
+            server.should_exit = True
+
+        threading.Thread(target=_watch_stop, daemon=True).start()
+        server.run()

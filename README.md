@@ -46,6 +46,30 @@ KHONG co du lieu — nho doi/them kenh `sim` khi test tren may khac may that.
 lang nghe (mac dinh `8000`, co the da doi neu port do bi chiem tren may
 dev — xem `../edge_collector/README.md` muc "Test tren 1 may").
 
+## Setup UI (web) — sua .env/channels.json khong can SSH
+
+Chay kem 5 loop nen (thread rieng, `uvicorn`), mac dinh cong `NODE_SETUP_PORT`
+(8091):
+
+```
+http://<dia-chi-node>:8091/setup            # sua NODE_EDGE_URL/SERIAL/NAME/KIND/interval
+http://<dia-chi-node>:8091/setup/channels   # them/xoa kenh cam bien (sim/serial)
+```
+
+Sau khi bam Save, node **tu thoat sach** (`os._exit`) - dua vao `restart:
+always` cua Docker de khoi dong lai voi config moi (node_agent khong ho tro
+hot-reload reader giua chung). Chay ngoai Docker (vd `python -m node_agent`
+truc tiep) se KHONG tu restart - phai tu chay lai tay.
+
+`NODE_SETUP_TOKEN` (mac dinh rong = khong gate gi, dung cho LAN noi bo) - dat
+1 gia tri de yeu cau HTTP Basic Auth (username bat ky, password = token nay)
+cho toan bo `/setup`.
+
+`docker-compose.hardware.yml` bind-mount ca thu muc `/dev:/dev` (khong liet
+ke tung `/dev/ttyUSB0`) - cam cam bien vao cong USB nao cung duoc, chi can
+chon dung `port` trong `channels.json` qua web UI, khong can sua file
+compose nua.
+
 ## `channels.json` — kenh cua CHINH node nay
 
 ```json

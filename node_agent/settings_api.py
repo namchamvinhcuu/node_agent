@@ -1,0 +1,565 @@
+# -*- coding: utf-8 -*-
+"""Trang web cau hinh local cho CHINH node nay (thay the sua .env/channels.json
+bang tay qua SSH):
+    GET  /setup            form sua .env (NODE_EDGE_URL/SERIAL/NAME/KIND + interval)
+    GET  /setup/channels    bang liet ke + form them kenh (sim/serial)
+    POST /setup, /setup/channels    ghi file ROI tu thoat sach (sys.exit) de
+                                     Docker `restart: always` khoi dong lai
+                                     voi config moi - node_agent KHONG ho tro
+                                     hot-reload readers giua chung (readers
+                                     duoc tao 1 lan luc _build_readers()).
+
+Threat-model + pattern bao mat (CSRF same-origin check, NODE_SETUP_TOKEN
+optional HTTP Basic Auth, secrets.compare_digest tranh timing attack) copy
+tu ../edge_collector/edge_collector/settings_api.py - sibling project da
+giai quyet dung bai toan nay (rui ro CSRF/token-leak qua tunnel), khong tu
+nghi lai tu dau. Don gian hoa nhieu so voi ban goc vi node_agent dung chien
+luoc "sua xong thi tu restart" thay vi hot-reload singleton settings.
+"""
+import base64
+import html
+import json
+import math
+import os
+import re
+import secrets
+import threading
+import time
+from pathlib import Path
+from typing import Dict, List
+from urllib.parse import urlsplit
+
+from dotenv.main import dotenv_values
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse, Response
+
+from .config import DOTENV_PATH, settings
+
+router = APIRouter()
+
+_ENV_PATH = DOTENV_PATH
+_READER_MODES = ("sim", "serial")
+
+_FIELDS = [
+    {"key": "NODE_EDGE_URL", "label": "Edge URL", "default": "http://127.0.0.1:8000",
+     "hint": "Dia chi cua edge_collector (khong phai Odoo Main)"},
+    {"key": "NODE_SERIAL", "label": "Node serial", "default": "NODE-01",
+     "hint": "Phai khop pcm.device.serial ben Odoo, hoac de Odoo tu tao lan dau"},
+    {"key": "NODE_NAME", "label": "Ten hien thi", "default": "",
+     "hint": "Ten Odoo dat cho pcm.device khi tu dang ky lan dau"},
+    {"key": "NODE_KIND", "label": "Loai node", "default": "other",
+     "hint": "pi | esp32 | pc | other"},
+    {"key": "NODE_HELLO_INTERVAL_S", "label": "Chu ky hello (s)", "default": "60", "hint": ""},
+    {"key": "NODE_HEARTBEAT_INTERVAL_S", "label": "Chu ky heartbeat (s)", "default": "30", "hint": ""},
+    {"key": "NODE_SUBMIT_INTERVAL_S", "label": "Chu ky gui do (s)", "default": "2", "hint": ""},
+    {"key": "NODE_COMMAND_POLL_INTERVAL_S", "label": "Chu ky poll lenh (s)", "default": "2", "hint": ""},
+    {"key": "NODE_SETUP_TOKEN", "label": "Setup access token", "default": "",
+     "hint": "De trong = khong gate gi (LAN-only). Dat 1 gia tri de yeu cau HTTP "
+             "Basic Auth (username bat ky, password = token nay) cho toan bo /setup.",
+     "input_type": "password"},
+]
+_INT_FIELDS = {"NODE_HELLO_INTERVAL_S", "NODE_HEARTBEAT_INTERVAL_S"}
+_FLOAT_FIELDS = {"NODE_SUBMIT_INTERVAL_S", "NODE_COMMAND_POLL_INTERVAL_S"}
+
+_CSS = """
+body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:24px}
+.wrap{max-width:720px;margin:0 auto}
+h1{font-size:20px;margin-bottom:4px}
+.sub{color:#94a3b8;font-size:13px;margin-bottom:20px}
+.card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:20px;margin-bottom:16px}
+.field{margin-bottom:14px}
+label{display:block;font-size:13px;font-weight:600;margin-bottom:4px}
+input,select{width:100%;box-sizing:border-box;background:#0f172a;color:#e2e8f0;
+  border:1px solid #334155;border-radius:6px;padding:8px 10px;font-size:14px}
+.hint{color:#64748b;font-size:12px;margin-top:4px}
+.err{color:#f87171;font-size:12px;margin-top:4px}
+button{background:#16a34a;color:#fff;border:none;border-radius:6px;padding:10px 18px;
+  font-size:14px;cursor:pointer}
+button.danger{background:#dc2626}
+.banner-ok{background:#052e16;border:1px solid #16a34a;color:#86efac;border-radius:6px;
+  padding:10px 14px;margin-bottom:16px;font-size:13px}
+.banner-err{background:#450a0a;border:1px solid #dc2626;color:#fca5a5;border-radius:6px;
+  padding:10px 14px;margin-bottom:16px;font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:16px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #334155}
+nav a{color:#93c5fd;margin-right:16px;font-size:13px;text-decoration:none}
+fieldset{border:1px solid #334155;border-radius:6px;margin-bottom:14px}
+legend{padding:0 6px;font-size:13px;color:#94a3b8}
+"""
+
+_NAV = ('<nav><a href="/setup">Node config (.env)</a>'
+        '<a href="/setup/channels">Channels</a></nav>')
+
+
+def _check_setup_auth(request: Request) -> "Response | None":
+    """Gate HTTP Basic Auth khi NODE_SETUP_TOKEN duoc dat - copy nguyen ly
+    tu edge_collector (secrets.compare_digest tranh timing attack, ma hoa
+    UTF-8 truoc khi so de tranh TypeError voi ky tu non-ASCII)."""
+    token = settings.setup_token
+    if not token:
+        return None
+    auth = request.headers.get("authorization", "")
+    supplied = ""
+    if auth.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(auth[6:]).decode("utf-8", "replace")
+            _, _, supplied = decoded.partition(":")
+        except (ValueError, UnicodeDecodeError):
+            supplied = ""
+    if supplied and secrets.compare_digest(supplied.encode("utf-8"), token.encode("utf-8")):
+        return None
+    return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="node setup"'})
+
+
+def _is_same_origin(request: Request) -> bool:
+    """Chan CSRF don gian - form POST tu trang khac van co the doi .env cua
+    nan nhan neu khong kiem tra nay. Copy tu edge_collector (best-effort,
+    khong phai auth that, dung threat-model LAN)."""
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if not origin:
+        return True
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    return (parsed.scheme, parsed.netloc) == (request.url.scheme, request.url.netloc)
+
+
+def _current_values() -> dict:
+    file_values = dotenv_values(_ENV_PATH) if _ENV_PATH.exists() else {}
+    return {f["key"]: file_values.get(f["key"], f["default"]) for f in _FIELDS}
+
+
+def _format_env_line(key: str, value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return '%s="%s"\n' % (key, escaped)
+
+
+def _write_env_file(path: Path, values: dict) -> None:
+    """Ghi truc tiep vao file dang co (truncate+write, khong tempfile+rename)
+    - giu nguyen dong/comment khac, chi thay dong co key trung. Copy chien
+    luoc tu edge_collector (tranh 'Device or resource busy' khi .env la
+    bind-mount 1 file rieng trong Docker)."""
+    remaining = dict(values)
+    replaced_keys = set()
+    out_lines = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
+            stripped = line.strip()
+            candidate = None
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                candidate = stripped.split("=", 1)[0].strip()
+            if candidate in replaced_keys:
+                continue
+            if candidate is not None and candidate in remaining:
+                out_lines.append(_format_env_line(candidate, remaining.pop(candidate)))
+                replaced_keys.add(candidate)
+            else:
+                out_lines.append(line if line.endswith("\n") else line + "\n")
+    for key, value in remaining.items():
+        out_lines.append(_format_env_line(key, value))
+    path.write_text("".join(out_lines), encoding="utf-8")
+
+
+def _validate(values: dict) -> Dict[str, List[str]]:
+    errors: Dict[str, List[str]] = {}
+
+    def add(key, msg):
+        errors.setdefault(key, []).append(msg)
+
+    for key, value in values.items():
+        if "\n" in value or "\r" in value:
+            add(key, "Khong duoc chua xuong dong")
+    if not values.get("NODE_EDGE_URL", "").startswith(("http://", "https://")):
+        add("NODE_EDGE_URL", "Phai bat dau bang http:// hoac https://")
+    if not values.get("NODE_SERIAL", "").strip():
+        add("NODE_SERIAL", "Khong duoc de trong")
+    for key in _INT_FIELDS:
+        try:
+            if int(values.get(key, "")) <= 0:
+                add(key, "Phai la so nguyen duong")
+        except ValueError:
+            add(key, "Phai la so nguyen")
+    for key in _FLOAT_FIELDS:
+        try:
+            fval = float(values.get(key, ""))
+            if not math.isfinite(fval) or fval <= 0:
+                add(key, "Phai la so thuc duong")
+        except ValueError:
+            add(key, "Phai la so")
+    return errors
+
+
+def _render_field(f: dict, values: dict, errors: Dict[str, List[str]]) -> str:
+    key = f["key"]
+    val = html.escape(str(values.get(key, "")))
+    input_type = f.get("input_type", "text")
+    err_html = "".join('<p class="err">%s</p>' % html.escape(e) for e in errors.get(key, []))
+    return (
+        '<div class="field">'
+        '<label for="%s">%s</label>'
+        '<input type="%s" id="%s" name="%s" value="%s">'
+        '%s'
+        '<p class="hint">%s</p>'
+        '</div>'
+    ) % (key, html.escape(f["label"]), input_type, key, key, val, err_html, html.escape(f["hint"]))
+
+
+def _render_setup(values: dict, errors=None, saved=False) -> HTMLResponse:
+    errors = errors or {}
+    banner = ""
+    if saved:
+        banner = ('<div class="banner-ok">Da luu. Node dang tu khoi dong lai '
+                   'de ap dung config moi (restart: always) - vai giay se ket noi lai.</div>')
+    if "_form" in errors:
+        banner = "".join('<div class="banner-err">%s</div>' % html.escape(e) for e in errors["_form"])
+    fields_html = "".join(_render_field(f, values, errors) for f in _FIELDS)
+    body = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Node Agent Setup</title><style>%s</style></head><body>"
+        "<div class='wrap'><h1>Node Agent</h1>"
+        "<p class='sub'>Node serial: %s</p>%s"
+        "<div class='card'>%s"
+        "<form method='post' action='/setup'>%s"
+        "<button type='submit'>Save</button></form></div></div>"
+        "</body></html>"
+    ) % (_CSS, html.escape(settings.serial), _NAV, banner, fields_html)
+    return HTMLResponse(body)
+
+
+@router.get("/setup", response_class=HTMLResponse)
+async def setup_get(request: Request):
+    denied = _check_setup_auth(request)
+    if denied:
+        return denied
+    return _render_setup(_current_values())
+
+
+@router.post("/setup", response_class=HTMLResponse)
+async def setup_post(request: Request):
+    denied = _check_setup_auth(request)
+    if denied:
+        return denied
+    if not _is_same_origin(request):
+        return HTMLResponse(
+            _render_setup(_current_values(),
+                          errors={"_form": ["Tu choi: request khong xuat phat tu trang /setup "
+                                             "(nghi CSRF) - mo lai /setup roi luu tu trang do"]}).body,
+            status_code=403)
+    form = await request.form()
+    values = {f["key"]: str(form.get(f["key"], "")).strip() for f in _FIELDS}
+    errors = _validate(values)
+    if errors:
+        return HTMLResponse(_render_setup(values, errors=errors).body, status_code=400)
+    if values == _current_values():
+        # Khong co gi thay doi - khong trigger restart (xem _schedule_restart,
+        # DoS-guard 2026-09-25).
+        return _render_setup(values, saved=True)
+    try:
+        _write_env_file(_ENV_PATH, values)
+    except OSError as exc:
+        return HTMLResponse(
+            _render_setup(_current_values(),
+                          errors={"_form": ["Khong ghi duoc .env: %s - kiem tra quyen ghi file "
+                                             "(container chay uid 1000, xem README)" % exc]}).body,
+            status_code=500)
+    _schedule_restart()
+    return _render_setup(values, saved=True)
+
+
+# ----------------------------------------------------------------------
+# Channels editor
+
+def _load_channels() -> list:
+    return settings.load_channels()
+
+
+def _write_channels(channels: list) -> None:
+    Path(settings.channels_file).write_text(
+        json.dumps(channels, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _unescape_terminator(s: str) -> str:
+    return s.replace("\\r", "\r").replace("\\n", "\n").replace("\\t", "\t")
+
+
+def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]:
+    errors: Dict[str, List[str]] = {}
+
+    def add(key, msg):
+        errors.setdefault(key, []).append(msg)
+
+    code = values.get("code", "").strip()
+    if not code:
+        add("code", "Khong duoc de trong")
+    elif code in existing_codes:
+        add("code", "Ma kenh '%s' da ton tai" % code)
+    if values.get("mode") not in _READER_MODES:
+        add("mode", "Phai la sim hoac serial")
+    if values.get("mode") == "sim":
+        for key in ("poll_ms",):
+            try:
+                if int(values.get(key, "")) <= 0:
+                    add(key, "Phai la so nguyen duong")
+            except ValueError:
+                add(key, "Phai la so nguyen")
+        for key in ("center", "spread"):
+            try:
+                float(values.get(key, ""))
+            except ValueError:
+                add(key, "Phai la so")
+    elif values.get("mode") == "serial":
+        if not values.get("port", "").strip():
+            add("port", "Khong duoc de trong")
+        try:
+            if int(values.get("baud", "")) <= 0:
+                add("baud", "Phai la so nguyen duong")
+        except ValueError:
+            add("baud", "Phai la so nguyen")
+        if values.get("data_bits") not in ("7", "8"):
+            add("data_bits", "Phai la 7 hoac 8")
+        if values.get("parity") not in ("none", "even", "odd"):
+            add("parity", "Phai la none/even/odd")
+        pattern = values.get("pattern", "").strip()
+        if not pattern:
+            add("pattern", "Khong duoc de trong")
+        else:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                # BAT BUOC validate truoc khi ghi - _build_readers() (agent.py)
+                # goi re.compile() KHI KHOI DONG, khong bọc try/except; pattern
+                # loi se lam CA process crash ngay luc start, va vi Docker
+                # `restart: always` cu khoi dong lai voi DUNG config loi do ->
+                # crash-loop vinh vien, phai SSH sua tay channels.json moi
+                # thoat duoc - xem python-reviewer 2026-09-25.
+                add("pattern", "Regex khong hop le: %s" % exc)
+        # value_group/stop_bits/stable_group deu duoc int() truc tiep o
+        # _channel_to_json - validate som o day de tra loi form ro rang thay
+        # vi HTTP 500 cau - xem python-reviewer 2026-09-25.
+        for key in ("value_group", "stop_bits"):
+            raw = values.get(key, "").strip()
+            if raw:
+                try:
+                    int(raw)
+                except ValueError:
+                    add(key, "Phai la so nguyen")
+        stable_group_raw = values.get("stable_group", "").strip()
+        if stable_group_raw:
+            try:
+                int(stable_group_raw)
+            except ValueError:
+                add("stable_group", "Phai la so nguyen")
+    return errors
+
+
+def _channel_to_json(values: dict) -> dict:
+    if values["mode"] == "sim":
+        return {
+            "code": values["code"], "mode": "sim",
+            "poll_ms": int(values["poll_ms"]),
+            "center": float(values["center"]), "spread": float(values["spread"]),
+        }
+    ch = {
+        "code": values["code"], "mode": "serial", "port": values["port"],
+        "baud": int(values["baud"]), "data_bits": int(values["data_bits"]),
+        "parity": values["parity"], "stop_bits": int(values.get("stop_bits") or 1),
+        "terminator": _unescape_terminator(values.get("terminator") or "\\r\\n"),
+        "pattern": values["pattern"],
+        "value_group": int(values.get("value_group") or 1),
+    }
+    if values.get("stable_group"):
+        ch["stable_group"] = int(values["stable_group"])
+    if values.get("stable_ok"):
+        ch["stable_ok"] = values["stable_ok"]
+    if values.get("cmd_zero"):
+        ch["cmd_zero"] = _unescape_terminator(values["cmd_zero"])
+    if values.get("cmd_tare"):
+        ch["cmd_tare"] = _unescape_terminator(values["cmd_tare"])
+    return ch
+
+
+def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
+    errors = errors or {}
+    channels = _load_channels()
+    banner = ""
+    if saved:
+        banner = '<div class="banner-ok">Da them kenh. Node dang tu khoi dong lai.</div>'
+    if deleted:
+        banner = '<div class="banner-ok">Da xoa kenh. Node dang tu khoi dong lai.</div>'
+    if "_form" in errors:
+        banner = "".join('<div class="banner-err">%s</div>' % html.escape(e) for e in errors["_form"])
+
+    rows = ""
+    for ch in channels:
+        summary = ch.get("port", "") if ch.get("mode") == "serial" else "center=%s" % ch.get("center", "")
+        rows += (
+            "<tr><td>%s</td><td>%s</td><td>%s</td>"
+            "<td><form method='post' action='/setup/channels' style='margin:0'>"
+            "<input type='hidden' name='action' value='delete'>"
+            "<input type='hidden' name='code' value='%s'>"
+            "<button type='submit' class='danger'>Delete</button></form></td></tr>"
+        ) % (html.escape(ch.get("code", "")), html.escape(ch.get("mode", "")),
+             html.escape(str(summary)), html.escape(ch.get("code", "")))
+    table = ("<table><tr><th>Code</th><th>Mode</th><th>Detail</th><th></th></tr>%s</table>"
+              % rows) if channels else "<p class='hint'>Chua co kenh nao.</p>"
+
+    def field(name, label, value="", err_key=None, itype="text"):
+        err_html = "".join('<p class="err">%s</p>' % html.escape(e)
+                            for e in errors.get(err_key or name, []))
+        return ('<div class="field"><label>%s</label>'
+                '<input type="%s" name="%s" value="%s">%s</div>') % (
+            html.escape(label), itype, name, html.escape(str(value)), err_html)
+
+    add_form = (
+        "<form method='post' action='/setup/channels'>"
+        "<input type='hidden' name='action' value='add'>"
+        + field("code", "Code")
+        + '<div class="field"><label>Mode</label>'
+          '<select name="mode" id="mode-select" onchange="'
+          "document.getElementById('sim-fields').style.display="
+          "this.value=='sim'?'block':'none';"
+          "document.getElementById('serial-fields').style.display="
+          "this.value=='serial'?'block':'none';\">"
+          '<option value="sim">sim</option><option value="serial">serial</option></select></div>'
+        + "<fieldset id='sim-fields'><legend>Sim</legend>"
+        + field("poll_ms", "Poll (ms)", "500")
+        + field("center", "Center", "0")
+        + field("spread", "Spread", "0.1")
+        + "</fieldset>"
+        + "<fieldset id='serial-fields' style='display:none'><legend>Serial</legend>"
+        + field("port", "Port", "/dev/ttyUSB0")
+        + field("baud", "Baud", "9600")
+        + field("data_bits", "Data bits (7/8)", "8")
+        + field("parity", "Parity (none/even/odd)", "none")
+        + field("stop_bits", "Stop bits", "1")
+        + field("terminator", "Terminator", "\\r\\n")
+        + field("pattern", "Pattern (regex)", "")
+        + field("value_group", "Value group", "1")
+        + field("stable_group", "Stable group", "")
+        + field("stable_ok", "Stable ok", "")
+        + field("cmd_zero", "Cmd zero", "")
+        + field("cmd_tare", "Cmd tare", "")
+        + "</fieldset>"
+        + "<button type='submit'>Add channel</button></form>"
+    )
+    body = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Node Agent Channels</title><style>%s</style></head><body>"
+        "<div class='wrap'><h1>Channels</h1>%s%s"
+        "<div class='card'>%s</div>"
+        "<div class='card'>%s</div></div></body></html>"
+    ) % (_CSS, _NAV, banner, table, add_form)
+    return HTMLResponse(body)
+
+
+@router.get("/setup/channels", response_class=HTMLResponse)
+async def channels_get(request: Request):
+    denied = _check_setup_auth(request)
+    if denied:
+        return denied
+    return _render_channels()
+
+
+@router.post("/setup/channels", response_class=HTMLResponse)
+async def channels_post(request: Request):
+    denied = _check_setup_auth(request)
+    if denied:
+        return denied
+    if not _is_same_origin(request):
+        return HTMLResponse(
+            _render_channels(errors={"_form": ["Tu choi: nghi CSRF - mo lai /setup/channels"]}).body,
+            status_code=403)
+    form = await request.form()
+    action = form.get("action")
+    channels = _load_channels()
+    if action == "delete":
+        code = form.get("code")
+        new_channels = [c for c in channels if c.get("code") != code]
+        if len(new_channels) == len(channels):
+            # Code khong ton tai - khong co gi thay doi, dung trigger restart
+            # (xem _schedule_restart, DoS-guard 2026-09-25).
+            return _render_channels(deleted=True)
+        try:
+            _write_channels(new_channels)
+        except OSError as exc:
+            return HTMLResponse(
+                _render_channels(errors={"_form": ["Khong ghi duoc channels.json: %s - kiem tra "
+                                                     "quyen ghi file (bo `:ro` trong docker-compose.yml "
+                                                     "neu dang mount read-only)" % exc]}).body,
+                status_code=500)
+        _schedule_restart()
+        return _render_channels(deleted=True)
+    if action == "add":
+        values = {k: str(form.get(k, "")).strip() for k in
+                  ("code", "mode", "poll_ms", "center", "spread", "port", "baud",
+                   "data_bits", "parity", "stop_bits", "terminator", "pattern",
+                   "value_group", "stable_group", "stable_ok", "cmd_zero", "cmd_tare")}
+        existing_codes = {c.get("code") for c in channels}
+        errors = _validate_channel(values, existing_codes)
+        if errors:
+            return HTMLResponse(_render_channels(errors=errors).body, status_code=400)
+        channels.append(_channel_to_json(values))
+        try:
+            _write_channels(channels)
+        except OSError as exc:
+            return HTMLResponse(
+                _render_channels(errors={"_form": ["Khong ghi duoc channels.json: %s - kiem tra "
+                                                     "quyen ghi file (bo `:ro` trong docker-compose.yml "
+                                                     "neu dang mount read-only)" % exc]}).body,
+                status_code=500)
+        _schedule_restart()
+        return _render_channels(saved=True)
+    return HTMLResponse(_render_channels(errors={"_form": ["Hanh dong khong hop le"]}).body,
+                         status_code=400)
+
+
+_RESTART_COOLDOWN_S = 10.0
+
+
+def _restart_marker_path() -> Path:
+    return Path(settings.state_dir) / "last_setup_restart"
+
+
+def _schedule_restart() -> bool:
+    """Node khong ho tro hot-reload readers giua chung (duoc tao 1 lan luc
+    _build_readers()) - cach don gian nhat de config moi co hieu luc la tu
+    thoat sach de Docker `restart: always` khoi dong lai tien trinh voi
+    .env/channels.json moi. Dat trong os._exit thread rieng + delay ngan de
+    HTTP response kip gui ve trinh duyet TRUOC khi tien trinh chet - _exit
+    (khong phai sys.exit) vi goi tu thread khac main thread, sys.exit chi
+    thoat thread hien tai.
+
+    Cooldown _RESTART_COOLDOWN_S: NODE_SETUP_TOKEN mac dinh rong (khong gate
+    gi) + _is_same_origin() cho qua request thieu Origin (vd `curl`) - khong
+    co cooldown, spam POST /setup se kill toan bo tien trinh (ca outbox/
+    reader/hello loop, khong chi web UI) lien tuc vo thoi han = DoS de dang.
+    PHAI persist cooldown xuong FILE (mtime cua marker trong state_dir, mount
+    qua named volume nen song sot qua restart), KHONG dung bien RAM - bien
+    RAM (`_last_restart_at` truoc day) bi chinh os._exit() xoa sach moi lan
+    trigger, nen process MOI sau restart luon thay "chua restart lan nao" va
+    cho qua ngay lap tuc - khong chan duoc dung kich ban tan cong that (1
+    request/lan container vua len lai) - xem python-reviewer 2026-09-25
+    (vong 2, bat duoc round-trip logic sai o vong 1). Tra False (khong
+    restart) neu goi lai qua gan lan truoc, KHONG bao gio bao loi cho nguoi
+    dung that (Save van thanh cong that su, chi delay ap dung toi da
+    _RESTART_COOLDOWN_S)."""
+    marker = _restart_marker_path()
+    now = time.time()
+    try:
+        last = marker.stat().st_mtime
+    except OSError:
+        last = 0.0
+    if now - last < _RESTART_COOLDOWN_S:
+        return False
+    try:
+        marker.touch()
+    except OSError:
+        pass          # best-effort - khong chan restart chi vi ghi marker loi
+
+    def _die():
+        time.sleep(0.5)
+        os._exit(0)
+
+    threading.Thread(target=_die, daemon=True).start()
+    return True
