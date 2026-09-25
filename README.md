@@ -111,6 +111,18 @@ compose nua.
   ket noi broker - khong can tu viet retry loop nhu Modbus. **Chua test voi
   broker MQTT that** (khong co trong moi truong phat trien) - chi verify
   bang mock callback `on_connect`/`on_message`/`on_disconnect` thu cong.
+- `mode: "gpio"` — doc digital input tren 1 chan GPIO (`pin`, danh so BCM)
+  cua CHINH thiet bi (chi chay duoc tren Pi that, dung thu vien `gpiozero`).
+  `pull_up` (true/false, bat dien tro keo len noi bo), `invert` (true/false,
+  dao gia tri doc duoc - dung cho cam bien active-low), `bounce_ms` (debounce,
+  0 = tat), `poll_ms`. Pham vi CHI digital input - khong ho tro doc analog,
+  khong ho tro `command()` ghi (GPIO output/actuator ngoai scope, se lam
+  rieng neu can). Da verify thuc nghiem: `import gpiozero` an toan tren may
+  dev x86 (khong co Pi that), chi loi khi THAT SU khoi tao Device (khong tim
+  duoc pin factory that) - reader tu retry voi backoff (1s->30s) giong
+  Modbus. **Chua test voi Pi that/GPIO that** - chi verify bang
+  `gpiozero.pins.mock.MockFactory` (chay THAT logic gpiozero, khong phai
+  mock thuan Python).
 
 Them mode moi (I2C/GPIO cam thang vao node, MQTT, OPC-UA...) bang cach viet
 mot class ke thua `readers.base.ChannelReader` (`_run()` + `command()`), dang

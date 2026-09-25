@@ -42,7 +42,7 @@ from .config import DOTENV_PATH, settings
 router = APIRouter()
 
 _ENV_PATH = DOTENV_PATH
-_READER_MODES = ("sim", "serial", "modbus", "mqtt")
+_READER_MODES = ("sim", "serial", "modbus", "mqtt", "gpio")
 
 _FIELDS = [
     {"key": "NODE_EDGE_URL", "label": "Edge URL", "default": "http://127.0.0.1:8000",
@@ -329,7 +329,7 @@ def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]
     elif code in existing_codes:
         add("code", "Channel code '%s' already exists" % code)
     if values.get("mode") not in _READER_MODES:
-        add("mode", "Must be sim, serial, modbus or mqtt")
+        add("mode", "Must be sim, serial, modbus, mqtt or gpio")
     if values.get("mode") == "sim":
         for key in ("poll_ms",):
             try:
@@ -437,6 +437,26 @@ def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]
             add("mqtt_port", "Must be an integer")
         if not values.get("topic", "").strip():
             add("topic", "Must not be blank")
+    elif values.get("mode") == "gpio":
+        try:
+            if int(values.get("pin", "")) < 0:
+                add("pin", "Must be a non-negative integer")
+        except ValueError:
+            add("pin", "Must be an integer")
+        if values.get("pull_up") not in ("true", "false"):
+            add("pull_up", "Must be true or false")
+        if values.get("invert") not in ("true", "false"):
+            add("invert", "Must be true or false")
+        try:
+            if int(values.get("bounce_ms", "")) < 0:
+                add("bounce_ms", "Must be a non-negative integer")
+        except ValueError:
+            add("bounce_ms", "Must be an integer")
+        try:
+            if int(values.get("gpio_poll_ms", "")) <= 0:
+                add("gpio_poll_ms", "Must be a positive integer")
+        except ValueError:
+            add("gpio_poll_ms", "Must be an integer")
     return errors
 
 
@@ -477,6 +497,13 @@ def _channel_to_json(values: dict) -> dict:
         if values.get("cmd_topic"):
             ch["cmd_topic"] = values["cmd_topic"]
         return ch
+    if values["mode"] == "gpio":
+        return {
+            "code": values["code"], "mode": "gpio", "pin": int(values["pin"]),
+            "pull_up": values["pull_up"] == "true", "invert": values["invert"] == "true",
+            "bounce_ms": int(values.get("bounce_ms") or 0),
+            "poll_ms": int(values["gpio_poll_ms"]),
+        }
     ch = {
         "code": values["code"], "mode": "serial", "port": values["port"],
         "baud": int(values["baud"]), "data_bits": int(values["data_bits"]),
@@ -518,6 +545,9 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
                 endpoint, ch.get("unit_id"), ch.get("register_type"), ch.get("address"))
         if mode == "mqtt":
             return "%s:%s topic=%s" % (ch.get("host", ""), ch.get("port", ""), ch.get("topic", ""))
+        if mode == "gpio":
+            return "pin=%s pull_up=%s invert=%s" % (
+                ch.get("pin"), ch.get("pull_up"), ch.get("invert"))
         return "center=%s" % ch.get("center", "")
 
     rows = ""
@@ -554,9 +584,12 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
           "document.getElementById('modbus-fields').style.display="
           "this.value=='modbus'?'block':'none';"
           "document.getElementById('mqtt-fields').style.display="
-          "this.value=='mqtt'?'block':'none';\">"
+          "this.value=='mqtt'?'block':'none';"
+          "document.getElementById('gpio-fields').style.display="
+          "this.value=='gpio'?'block':'none';\">"
           '<option value="sim">sim</option><option value="serial">serial</option>'
-          '<option value="modbus">modbus</option><option value="mqtt">mqtt</option></select></div>'
+          '<option value="modbus">modbus</option><option value="mqtt">mqtt</option>'
+          '<option value="gpio">gpio</option></select></div>'
         + "<fieldset id='sim-fields'><legend>Sim</legend>"
         + field("poll_ms", "Poll (ms)", "500")
         + field("center", "Center", "0")
@@ -609,6 +642,13 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
         + field("topic", "Subscribe topic", "")
         + field("json_key", "JSON key (blank = raw numeric payload)", "")
         + field("cmd_topic", "Publish topic for commands (blank = <topic>/cmd)", "")
+        + "</fieldset>"
+        + "<fieldset id='gpio-fields' style='display:none'><legend>GPIO</legend>"
+        + field("pin", "GPIO pin (BCM numbering)", "4")
+        + field("pull_up", "Pull up (true/false)", "false")
+        + field("invert", "Invert reading (true/false)", "false")
+        + field("bounce_ms", "Debounce (ms, 0 = off)", "0")
+        + field("gpio_poll_ms", "Poll (ms)", "200")
         + "</fieldset>"
         + "<button type='submit'>Add channel</button></form>"
     )
@@ -710,7 +750,8 @@ async def channels_post(request: Request):
                    "conn_type", "host", "tcp_port", "modbus_port", "modbus_baud",
                    "unit_id", "register_type", "address", "data_type", "scale",
                    "offset", "modbus_poll_ms", "mqtt_host", "mqtt_port", "username",
-                   "password", "topic", "json_key", "cmd_topic")}
+                   "password", "topic", "json_key", "cmd_topic", "pin", "pull_up",
+                   "invert", "bounce_ms", "gpio_poll_ms")}
         existing_codes = {c.get("code") for c in channels}
         errors = _validate_channel(values, existing_codes)
         if errors:

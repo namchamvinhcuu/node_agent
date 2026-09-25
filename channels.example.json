@@ -61,5 +61,14 @@
     "port": 1883,
     "topic": "factory/sensor42/humidity",
     "json_key": "v"
+  },
+  {
+    "code": "door_sensor",
+    "mode": "gpio",
+    "pin": 17,
+    "pull_up": true,
+    "invert": false,
+    "bounce_ms": 50,
+    "poll_ms": 200
   }
 ]
