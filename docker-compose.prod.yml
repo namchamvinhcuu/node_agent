@@ -1,0 +1,19 @@
+# Override CHI dung khi deploy BANG IMAGE DA PUSH Docker Hub (khong build tai
+# cho - danh cho thiet bi that nhu OrangePi/Raspberry Pi, hoac may khong can
+# build local). `build: .` van con trong docker-compose.yml (base) nhung VO
+# HAI o day: `docker compose pull` luon lay theo ten trong `image:`, va
+# `docker compose up -d` (KHONG co --build) chi build lai neu image chua ton
+# tai local - da pull xong thi khong rebuild.
+#
+# Chay:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     -f docker-compose.hardware.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     -f docker-compose.hardware.yml up -d
+#
+# Xem .claude/references/deploy-runbook.md (hoac Knowledge-Base vault) cho
+# quy trinh deploy day du (build+push tren may dev -> pull+up tren thiet bi
+# that -> don dep image cu).
+services:
+  node-agent:
+    image: evilhero/node-agent:latest
