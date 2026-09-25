@@ -114,12 +114,39 @@ compose nua.
     "scale", "offset"}, ...]` to a Modbus channel to read them all in one
     request and emit each as its own channel code - `reg_offset` is the
     position (in REGISTERS, not bytes) within the block, counted from the
-    channel's `address`. See `channels.example.json`'s `th_sensor` entry.
+    channel's `address`. See `channels.example.json`'s `temp_rtu` entry
+    (its top-level `code` doubles as point index 0's code, exactly like the
+    Setup UI produces when converting a plain channel via "Add point").
     Without `points`, a channel behaves exactly as before (single value).
     The Setup UI's Channels page has an "Add point to existing Modbus
     source" form to attach a new point to an already-configured Modbus
     channel (converting it to a multi-point source on first use) without
     hand-editing `channels.json`.
+
+    **Walkthrough — registering a temp+humidity RS485 sensor via
+    `/setup/channels`** (this is exactly how `temp_rtu`/`humi_rtu` in
+    `channels.example.json` were set up, verified for real on OrangePi3B):
+    1. "Add channel" form for the FIRST point (temperature): `Code=temp_rtu`,
+       `Mode=modbus`, `Connection type=rtu`, `Serial port` (use Scan to find
+       it), `Baud=9600`, `Unit id=1`, `Register type=holding`,
+       `Register address=0`, `Data type=u16`, `Scale=0.1`, `Poll (ms)=2000`.
+       Submit → this becomes the Modbus source everything else attaches to.
+    2. "Add point to existing Modbus source" form for the SECOND value
+       (humidity): `Source=temp_rtu` (the one just created), `New point
+       code=humi_rtu`, `Register offset=1` (the next register right after
+       temperature - **counted in REGISTERS, not bytes**), `Data
+       type=u16`, `Scale=0.1`, `Offset=0`. Submit → `temp_rtu` is
+       automatically converted into a multi-point source; both values are
+       now read together in one request.
+    3. Repeat step 2 for a third value (e.g. pressure) on the same bus:
+       pick the next free `Register offset` (if a point uses `u32`/`f32`
+       it takes 2 registers - leave enough room, the form rejects an
+       overlapping offset with a clear error).
+    4. Not sure which `address`/`reg_offset` a device actually answers to?
+       Don't guess - probe it directly first (`docker exec <container>
+       python3 -c "..."` with a few `read_holding_registers(addr, count=N,
+       device_id=...)` calls) the way this exact sensor was diagnosed, then
+       register the values that came back correctly.
 - `mode: "mqtt"` — subscribe DUNG 1 `topic` tren broker (`host`/`port`,
   `username`/`password` optional). Khac Modbus/serial (node CHU DONG poll),
   MQTT la PUSH-based: broker gui gia tri moi bat cu luc nao qua callback

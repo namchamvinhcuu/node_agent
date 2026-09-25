@@ -1041,11 +1041,10 @@ def test_channels_list_page_shows_one_row_per_point(client, tmp_path):
 def test_all_codes_includes_top_level_code_even_when_different_from_all_nested_points():
     """Regression Major #2: TRUOC DAY _all_codes() dung if/else (CHI add
     top-level code KHI KHONG co "points") - bo sot truong hop channels.json
-    sua tay co top-level "code" KHAC voi MOI code trong "points" (vd
-    "th_sensor" trong channels.example.json). Top-level code do CUNG la
-    `value` cua dropdown "Add point" source - thieu no o day se cho phep 1
-    kenh moi dung tren trung code, va khi trung se lam dropdown tro NHAM
-    sang nguon vat ly khac."""
+    sua tay co top-level "code" KHAC voi MOI code trong "points". Top-level
+    code do CUNG la `value` cua dropdown "Add point" source - thieu no o
+    day se cho phep 1 kenh moi dung trung code, va khi trung se lam
+    dropdown tro NHAM sang nguon vat ly khac."""
     channels = [{
         "code": "th_sensor", "mode": "modbus", "conn_type": "tcp",
         "host": "10.0.0.9", "tcp_port": 502,

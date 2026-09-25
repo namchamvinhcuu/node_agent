@@ -72,7 +72,7 @@
     "poll_ms": 200
   },
   {
-    "code": "th_sensor",
+    "code": "temp_rtu",
     "mode": "modbus",
     "conn_type": "rtu",
     "port": "/dev/ttyUSB2",
