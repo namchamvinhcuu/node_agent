@@ -79,6 +79,15 @@ class ModbusReader(ChannelReader):
         self._register_type = cfg.get("register_type", "holding")
         self._scale = float(cfg.get("scale", 1) or 1)
         self._offset = float(cfg.get("offset", 0) or 0)
+        # Ep kieu NGAY o __init__ (duoc agent.py::_build_readers() boc
+        # try/except) thay vi doc lai tu self.cfg trong _run() - _run() chay
+        # tren thread TRAN khong duoc Agent._guarded() bao ve, channels.json
+        # sua tay ngoai UI co the ghi gia tri sai kieu (vd poll_ms dang chuoi)
+        # se lam thread chet im lang vinh vien du status.online da la True -
+        # bug tuong tu da fix o readers/gpio.py (python-reviewer 2026-09-25,
+        # review-rule da duyet cho node_agent/readers/*.py), pre-existing tu
+        # Phase 1, sua theo yeu cau Nam.
+        self._poll_s = max(0.2, float(cfg.get("poll_ms", 1000)) / 1000.0)
 
     def _connect(self):
         if self.cfg.get("conn_type") == "tcp":
@@ -105,7 +114,6 @@ class ModbusReader(ChannelReader):
         return raw * self._scale + self._offset
 
     def _run(self):
-        poll_ms = self.cfg.get("poll_ms", 1000)
         backoff = _BACKOFF_MIN_S
         while not self._stop.is_set():
             try:
@@ -142,7 +150,7 @@ class ModbusReader(ChannelReader):
                 # CHI reset backoff sau khi doc THANH CONG that su - khong
                 # phai ngay sau connect (xem comment tren).
                 backoff = _BACKOFF_MIN_S
-                self._stop.wait(max(0.2, poll_ms / 1000.0))
+                self._stop.wait(self._poll_s)
             if self._client:
                 self._client.close()
                 self._client = None

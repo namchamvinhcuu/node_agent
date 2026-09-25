@@ -127,6 +127,29 @@ def test_encode_rounds_instead_of_truncating_floating_point_noise(raw):
 
 
 # ----------------------------------------------------------------------
+# 2b) ModbusReader.__init__() - ep kieu poll_ms (cung lop bug da fix o
+#     readers/gpio.py, Phase 3 - xem test_gpio_reader.py::
+#     test_init_poll_ms_non_numeric_string_raises_value_error)
+
+def test_init_poll_ms_non_numeric_string_raises_value_error():
+    """Regression: channels.json sua tay ghi poll_ms khong parse duoc (vd
+    "abc") PHAI raise ValueError NGAY trong __init__ (duoc agent.py::
+    _build_readers() bat va skip kenh) - KHONG duoc de lot vao _run() roi
+    thread chet im lang giua vong lap (status.online da la True tu truoc do
+    -> health-check bao SAI la kenh van online)."""
+    with pytest.raises(ValueError):
+        ModbusReader(_tcp_cfg(poll_ms="abc"), emit=Mock())
+
+
+def test_init_poll_ms_numeric_string_parses_correctly():
+    """Khong phai case fail: poll_ms dang chuoi so hop le ("1000") van phai
+    parse duoc binh thuong, KHONG raise."""
+    reader = ModbusReader(_tcp_cfg(poll_ms="1000"), emit=Mock())
+
+    assert reader._poll_s == 1.0
+
+
+# ----------------------------------------------------------------------
 # 3) ModbusReader._connect()
 
 def _tcp_cfg(**overrides):
