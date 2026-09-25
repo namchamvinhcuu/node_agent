@@ -335,6 +335,141 @@ def test_channel_to_json_serial_converts_literal_terminator_to_real_crlf_bytes()
 
 
 # ----------------------------------------------------------------------
+# 3b) _validate_channel + _channel_to_json - mode=modbus (reader moi,
+# CHUA co thiet bi Modbus that trong moi truong dev - xem
+# node_agent/readers/modbus.py va tests/test_modbus_reader.py)
+
+def _valid_modbus_tcp_values(**overrides):
+    values = {
+        "code": "vfd1", "mode": "modbus", "conn_type": "tcp",
+        "host": "10.0.0.5", "tcp_port": "502",
+        "unit_id": "1", "register_type": "holding", "address": "0",
+        "data_type": "u16", "scale": "1", "offset": "0", "modbus_poll_ms": "1000",
+    }
+    values.update(overrides)
+    return values
+
+
+def _valid_modbus_rtu_values(**overrides):
+    values = {
+        "code": "vfd2", "mode": "modbus", "conn_type": "rtu",
+        "modbus_port": "/dev/ttyUSB2", "modbus_baud": "19200",
+        "unit_id": "1", "register_type": "input", "address": "0",
+        "data_type": "u16", "scale": "1", "offset": "0", "modbus_poll_ms": "1000",
+    }
+    values.update(overrides)
+    return values
+
+
+def test_validate_channel_accepts_happy_modbus_tcp():
+    assert settings_api._validate_channel(_valid_modbus_tcp_values(), existing_codes=set()) == {}
+
+
+def test_validate_channel_accepts_happy_modbus_rtu():
+    assert settings_api._validate_channel(_valid_modbus_rtu_values(), existing_codes=set()) == {}
+
+
+def test_validate_channel_rejects_modbus_tcp_missing_host_and_port():
+    values = _valid_modbus_tcp_values(host="  ", tcp_port="")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "host" in errors
+    assert "tcp_port" in errors
+
+
+def test_validate_channel_rejects_modbus_tcp_non_integer_port():
+    values = _valid_modbus_tcp_values(tcp_port="not-a-port")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "tcp_port" in errors
+
+
+def test_validate_channel_rejects_modbus_rtu_missing_port_and_baud():
+    values = _valid_modbus_rtu_values(modbus_port="  ", modbus_baud="")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "modbus_port" in errors
+    assert "modbus_baud" in errors
+
+
+def test_validate_channel_rejects_modbus_rtu_non_integer_baud():
+    values = _valid_modbus_rtu_values(modbus_baud="fast")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "modbus_baud" in errors
+
+
+def test_validate_channel_rejects_modbus_invalid_conn_type():
+    values = _valid_modbus_tcp_values(conn_type="bogus")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "conn_type" in errors
+    # conn_type sai -> khong con biet kiem host/tcp_port hay port/baud, khong
+    # duoc bao loi nham vao 2 nhanh do (xem nhanh elif trong _validate_channel).
+    assert "host" not in errors
+    assert "modbus_port" not in errors
+
+
+def test_validate_channel_rejects_modbus_invalid_data_type():
+    values = _valid_modbus_tcp_values(data_type="u8")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "data_type" in errors
+
+
+def test_validate_channel_rejects_modbus_invalid_register_type():
+    values = _valid_modbus_tcp_values(register_type="coil")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "register_type" in errors
+
+
+def test_validate_channel_rejects_modbus_negative_address():
+    values = _valid_modbus_tcp_values(address="-1")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "address" in errors
+
+
+def test_validate_channel_rejects_modbus_non_integer_unit_id():
+    values = _valid_modbus_tcp_values(unit_id="abc")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "unit_id" in errors
+
+
+def test_validate_channel_rejects_modbus_non_integer_poll_ms():
+    values = _valid_modbus_tcp_values(modbus_poll_ms="abc")
+    errors = settings_api._validate_channel(values, existing_codes=set())
+    assert "modbus_poll_ms" in errors
+
+
+def test_channel_to_json_modbus_tcp_maps_fields_correctly():
+    values = _valid_modbus_tcp_values(unit_id="3", register_type="holding", address="10",
+                                       data_type="f32", scale="2.5", offset="1.0",
+                                       modbus_poll_ms="500", host="10.0.0.5", tcp_port="502")
+    ch = settings_api._channel_to_json(values)
+    assert ch == {
+        "code": "vfd1", "mode": "modbus", "conn_type": "tcp",
+        "unit_id": 3, "register_type": "holding", "address": 10, "data_type": "f32",
+        "scale": 2.5, "offset": 1.0, "poll_ms": 500,
+        "host": "10.0.0.5", "tcp_port": 502,
+    }
+    # KHONG duoc lan sang field cua nhanh rtu.
+    assert "port" not in ch
+    assert "baud" not in ch
+
+
+def test_channel_to_json_modbus_rtu_maps_fields_correctly():
+    """RTU: modbus_port -> port, modbus_baud -> baud, modbus_poll_ms ->
+    poll_ms trong JSON output - day la 3 field UI dat ten khac JSON channel
+    that su (tranh trung ten voi "port"/"baud" cua mode=serial trong cung
+    form add-channel)."""
+    values = _valid_modbus_rtu_values(modbus_port="/dev/ttyUSB2", modbus_baud="19200",
+                                       scale="", offset="", modbus_poll_ms="1000")
+    ch = settings_api._channel_to_json(values)
+    assert ch == {
+        "code": "vfd2", "mode": "modbus", "conn_type": "rtu",
+        "unit_id": 1, "register_type": "input", "address": 0, "data_type": "u16",
+        "scale": 1.0, "offset": 0.0, "poll_ms": 1000,
+        "port": "/dev/ttyUSB2", "baud": 19200,
+    }
+    assert "host" not in ch
+    assert "tcp_port" not in ch
+
+
+# ----------------------------------------------------------------------
 # 4) _is_same_origin
 
 def _same_origin_probe_app():

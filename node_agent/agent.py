@@ -14,6 +14,7 @@ import uuid
 
 from .config import settings
 from .edge_client import EdgeClient
+from .readers.modbus import ModbusReader
 from .readers.serial_ascii import SerialReader
 from .readers.sim import SimReader
 from .settings_api import router as settings_router
@@ -22,7 +23,7 @@ from .store import Store
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 _logger = logging.getLogger("node.agent")
 
-READER_CLASSES = {"sim": SimReader, "serial": SerialReader}
+READER_CLASSES = {"sim": SimReader, "serial": SerialReader, "modbus": ModbusReader}
 
 # Khop nodes/esp32/components/uplink/uplink.c::backoff_sleep() - gui that bai
 # lien tuc (edge sap hoac dang restart) ma cu doi 2s co dinh se don dap edge

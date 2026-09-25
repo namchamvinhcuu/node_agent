@@ -25,5 +25,33 @@
     "stable_ok": "ST",
     "cmd_zero": "Z\r\n",
     "cmd_tare": "T\r\n"
+  },
+  {
+    "code": "temp_plc",
+    "mode": "modbus",
+    "conn_type": "tcp",
+    "host": "10.0.0.5",
+    "tcp_port": 502,
+    "unit_id": 1,
+    "register_type": "holding",
+    "address": 100,
+    "data_type": "f32",
+    "scale": 1,
+    "offset": 0,
+    "poll_ms": 1000
+  },
+  {
+    "code": "vfd_speed",
+    "mode": "modbus",
+    "conn_type": "rtu",
+    "port": "/dev/ttyUSB1",
+    "baud": 9600,
+    "unit_id": 3,
+    "register_type": "holding",
+    "address": 0,
+    "data_type": "u16",
+    "scale": 0.1,
+    "offset": 0,
+    "poll_ms": 1000
   }
 ]

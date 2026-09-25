@@ -87,10 +87,24 @@ compose nua.
 - `mode: "serial"` — mot cong USB-serial ASCII (`readers/serial_ascii.py`),
   cung cu phap regex/terminator nhu `pcm.serial.profile` ben Odoo nhung khai
   bao CUC BO (node khong tu dong keo profile tu Odoo trong MVP nay).
+- `mode: "modbus"` — Modbus RTU (`conn_type: "rtu"`, qua `port`/`baud`) hoac
+  TCP (`conn_type: "tcp"`, qua `host`/`tcp_port`) — dung cho thiet bi cong
+  nghiep (bien tan, PLC, cam bien Modbus). `register_type` (holding/input),
+  `unit_id` (slave address), `address` (offset thanh ghi), `data_type`
+  (u16/i16/u32/i32/f32 - quyet dinh cach ghep byte tu 1-2 thanh ghi 16-bit),
+  `scale`/`offset` (gia tri that = raw*scale + offset). Ho tro `command("write",
+  value)` de ghi nguoc xuong holding register (vd dieu khien relay/setpoint
+  qua bien tan) - input register la read-only theo dung chuan Modbus. Tu
+  retry ket noi voi backoff (1s->30s) khi mat mang, KHONG die vinh vien nhu
+  `serial` (thiet bi Modbus mang thuong gian doan tam thoi hon la loi vinh
+  vien). **Chua test voi thiet bi/PLC Modbus that** (khong co trong moi
+  truong phat trien) - chi verify bang mock + test ket noi that toi dia chi
+  khong ton tai (xac nhan tu retry dung, khong crash).
 
-Them mode moi (Modbus/I2C/GPIO cam thang vao node...) bang cach viet mot class
-ke thua `readers.base.ChannelReader` (`_run()` + `command()`), dang ky vao
-`READER_CLASSES` trong `agent.py`.
+Them mode moi (I2C/GPIO cam thang vao node, MQTT, OPC-UA...) bang cach viet
+mot class ke thua `readers.base.ChannelReader` (`_run()` + `command()`), dang
+ky vao `READER_CLASSES` trong `agent.py`. Xem `.obsidian-vault/Plan/
+node-agent-multi-protocol-readers.md` cho ke hoach cac mode dang lam.
 
 ## Giao thuc `/node/v1/*` (tren edge_collector)
 

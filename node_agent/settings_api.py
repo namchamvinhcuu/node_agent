@@ -42,7 +42,7 @@ from .config import DOTENV_PATH, settings
 router = APIRouter()
 
 _ENV_PATH = DOTENV_PATH
-_READER_MODES = ("sim", "serial")
+_READER_MODES = ("sim", "serial", "modbus")
 
 _FIELDS = [
     {"key": "NODE_EDGE_URL", "label": "Edge URL", "default": "http://127.0.0.1:8000",
@@ -329,7 +329,7 @@ def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]
     elif code in existing_codes:
         add("code", "Channel code '%s' already exists" % code)
     if values.get("mode") not in _READER_MODES:
-        add("mode", "Must be sim or serial")
+        add("mode", "Must be sim, serial or modbus")
     if values.get("mode") == "sim":
         for key in ("poll_ms",):
             try:
@@ -384,6 +384,49 @@ def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]
                 int(stable_group_raw)
             except ValueError:
                 add("stable_group", "Must be an integer")
+    elif values.get("mode") == "modbus":
+        if values.get("conn_type") not in ("tcp", "rtu"):
+            add("conn_type", "Must be tcp or rtu")
+        elif values["conn_type"] == "tcp":
+            if not values.get("host", "").strip():
+                add("host", "Must not be blank")
+            try:
+                if int(values.get("tcp_port", "")) <= 0:
+                    add("tcp_port", "Must be a positive integer")
+            except ValueError:
+                add("tcp_port", "Must be an integer")
+        else:
+            if not values.get("modbus_port", "").strip():
+                add("modbus_port", "Must not be blank")
+            try:
+                if int(values.get("modbus_baud", "")) <= 0:
+                    add("modbus_baud", "Must be a positive integer")
+            except ValueError:
+                add("modbus_baud", "Must be an integer")
+        try:
+            if int(values.get("unit_id", "")) <= 0:
+                add("unit_id", "Must be a positive integer")
+        except ValueError:
+            add("unit_id", "Must be an integer")
+        if values.get("register_type") not in ("holding", "input"):
+            add("register_type", "Must be holding or input")
+        try:
+            if int(values.get("address", "")) < 0:
+                add("address", "Must be a non-negative integer")
+        except ValueError:
+            add("address", "Must be an integer")
+        if values.get("data_type") not in ("u16", "i16", "u32", "i32", "f32"):
+            add("data_type", "Must be one of u16/i16/u32/i32/f32")
+        for key in ("scale", "offset"):
+            try:
+                float(values.get(key, ""))
+            except ValueError:
+                add(key, "Must be a number")
+        try:
+            if int(values.get("modbus_poll_ms", "")) <= 0:
+                add("modbus_poll_ms", "Must be a positive integer")
+        except ValueError:
+            add("modbus_poll_ms", "Must be an integer")
     return errors
 
 
@@ -394,6 +437,21 @@ def _channel_to_json(values: dict) -> dict:
             "poll_ms": int(values["poll_ms"]),
             "center": float(values["center"]), "spread": float(values["spread"]),
         }
+    if values["mode"] == "modbus":
+        ch = {
+            "code": values["code"], "mode": "modbus", "conn_type": values["conn_type"],
+            "unit_id": int(values["unit_id"]), "register_type": values["register_type"],
+            "address": int(values["address"]), "data_type": values["data_type"],
+            "scale": float(values.get("scale") or 1), "offset": float(values.get("offset") or 0),
+            "poll_ms": int(values["modbus_poll_ms"]),
+        }
+        if values["conn_type"] == "tcp":
+            ch["host"] = values["host"]
+            ch["tcp_port"] = int(values["tcp_port"])
+        else:
+            ch["port"] = values["modbus_port"]
+            ch["baud"] = int(values["modbus_baud"])
+        return ch
     ch = {
         "code": values["code"], "mode": "serial", "port": values["port"],
         "baud": int(values["baud"]), "data_bits": int(values["data_bits"]),
@@ -424,9 +482,20 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
     if "_form" in errors:
         banner = "".join('<div class="banner-err">%s</div>' % html.escape(e) for e in errors["_form"])
 
+    def _channel_summary(ch: dict) -> str:
+        mode = ch.get("mode")
+        if mode == "serial":
+            return ch.get("port", "")
+        if mode == "modbus":
+            endpoint = ch.get("host", "") + ":" + str(ch.get("tcp_port", "")) \
+                if ch.get("conn_type") == "tcp" else ch.get("port", "")
+            return "%s unit=%s reg=%s@%s" % (
+                endpoint, ch.get("unit_id"), ch.get("register_type"), ch.get("address"))
+        return "center=%s" % ch.get("center", "")
+
     rows = ""
     for ch in channels:
-        summary = ch.get("port", "") if ch.get("mode") == "serial" else "center=%s" % ch.get("center", "")
+        summary = _channel_summary(ch)
         rows += (
             "<tr><td>%s</td><td>%s</td><td>%s</td>"
             "<td><form method='post' action='/setup/channels' style='margin:0'>"
@@ -454,8 +523,11 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
           "document.getElementById('sim-fields').style.display="
           "this.value=='sim'?'block':'none';"
           "document.getElementById('serial-fields').style.display="
-          "this.value=='serial'?'block':'none';\">"
-          '<option value="sim">sim</option><option value="serial">serial</option></select></div>'
+          "this.value=='serial'?'block':'none';"
+          "document.getElementById('modbus-fields').style.display="
+          "this.value=='modbus'?'block':'none';\">"
+          '<option value="sim">sim</option><option value="serial">serial</option>'
+          '<option value="modbus">modbus</option></select></div>'
         + "<fieldset id='sim-fields'><legend>Sim</legend>"
         + field("poll_ms", "Poll (ms)", "500")
         + field("center", "Center", "0")
@@ -474,6 +546,31 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
         + field("stable_ok", "Stable ok", "")
         + field("cmd_zero", "Cmd zero", "")
         + field("cmd_tare", "Cmd tare", "")
+        + "</fieldset>"
+        + "<fieldset id='modbus-fields' style='display:none'><legend>Modbus</legend>"
+        + ('<div class="field"><label>Connection type</label>'
+           '<select name="conn_type" id="modbus-conn-select" onchange="'
+           "document.getElementById('modbus-tcp-fields').style.display="
+           "this.value=='tcp'?'block':'none';"
+           "document.getElementById('modbus-rtu-fields').style.display="
+           "this.value=='rtu'?'block':'none';\">"
+           '<option value="tcp">tcp</option><option value="rtu">rtu</option></select>%s</div>'
+           % "".join('<p class="err">%s</p>' % html.escape(e) for e in errors.get("conn_type", [])))
+        + "<div id='modbus-tcp-fields'>"
+        + field("host", "Host", "127.0.0.1")
+        + field("tcp_port", "TCP port", "502")
+        + "</div>"
+        + "<div id='modbus-rtu-fields' style='display:none'>"
+        + field("modbus_port", "Serial port", "/dev/ttyUSB0")
+        + field("modbus_baud", "Baud", "9600")
+        + "</div>"
+        + field("unit_id", "Unit id (slave address)", "1")
+        + field("register_type", "Register type (holding/input)", "holding")
+        + field("address", "Register address", "0")
+        + field("data_type", "Data type (u16/i16/u32/i32/f32)", "u16")
+        + field("scale", "Scale", "1")
+        + field("offset", "Offset", "0")
+        + field("modbus_poll_ms", "Poll (ms)", "1000")
         + "</fieldset>"
         + "<button type='submit'>Add channel</button></form>"
     )
@@ -571,7 +668,10 @@ async def channels_post(request: Request):
         values = {k: str(form.get(k, "")).strip() for k in
                   ("code", "mode", "poll_ms", "center", "spread", "port", "baud",
                    "data_bits", "parity", "stop_bits", "terminator", "pattern",
-                   "value_group", "stable_group", "stable_ok", "cmd_zero", "cmd_tare")}
+                   "value_group", "stable_group", "stable_ok", "cmd_zero", "cmd_tare",
+                   "conn_type", "host", "tcp_port", "modbus_port", "modbus_baud",
+                   "unit_id", "register_type", "address", "data_type", "scale",
+                   "offset", "modbus_poll_ms")}
         existing_codes = {c.get("code") for c in channels}
         errors = _validate_channel(values, existing_codes)
         if errors:
