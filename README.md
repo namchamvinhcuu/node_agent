@@ -100,6 +100,17 @@ compose nua.
   vien). **Chua test voi thiet bi/PLC Modbus that** (khong co trong moi
   truong phat trien) - chi verify bang mock + test ket noi that toi dia chi
   khong ton tai (xac nhan tu retry dung, khong crash).
+- `mode: "mqtt"` — subscribe DUNG 1 `topic` tren broker (`host`/`port`,
+  `username`/`password` optional). Khac Modbus/serial (node CHU DONG poll),
+  MQTT la PUSH-based: broker gui gia tri moi bat cu luc nao qua callback
+  `on_message` cua `paho-mqtt`, khong co `poll_ms`. Payload mac dinh la so
+  tho (`float(payload)`); neu thiet bi gui JSON, khai bao `json_key` de lay
+  dung 1 key phang (vd `{"v": 23.4}` + `json_key: "v"`) - KHONG ho tro nested
+  path. Ho tro `command()` bang cach publish xuong `cmd_topic` (mac dinh
+  `<topic>/cmd`). Thu vien `paho-mqtt` tu dong reconnect voi backoff khi mat
+  ket noi broker - khong can tu viet retry loop nhu Modbus. **Chua test voi
+  broker MQTT that** (khong co trong moi truong phat trien) - chi verify
+  bang mock callback `on_connect`/`on_message`/`on_disconnect` thu cong.
 
 Them mode moi (I2C/GPIO cam thang vao node, MQTT, OPC-UA...) bang cach viet
 mot class ke thua `readers.base.ChannelReader` (`_run()` + `command()`), dang

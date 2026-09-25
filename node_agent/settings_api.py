@@ -42,7 +42,7 @@ from .config import DOTENV_PATH, settings
 router = APIRouter()
 
 _ENV_PATH = DOTENV_PATH
-_READER_MODES = ("sim", "serial", "modbus")
+_READER_MODES = ("sim", "serial", "modbus", "mqtt")
 
 _FIELDS = [
     {"key": "NODE_EDGE_URL", "label": "Edge URL", "default": "http://127.0.0.1:8000",
@@ -329,7 +329,7 @@ def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]
     elif code in existing_codes:
         add("code", "Channel code '%s' already exists" % code)
     if values.get("mode") not in _READER_MODES:
-        add("mode", "Must be sim, serial or modbus")
+        add("mode", "Must be sim, serial, modbus or mqtt")
     if values.get("mode") == "sim":
         for key in ("poll_ms",):
             try:
@@ -427,6 +427,16 @@ def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]
                 add("modbus_poll_ms", "Must be a positive integer")
         except ValueError:
             add("modbus_poll_ms", "Must be an integer")
+    elif values.get("mode") == "mqtt":
+        if not values.get("mqtt_host", "").strip():
+            add("mqtt_host", "Must not be blank")
+        try:
+            if int(values.get("mqtt_port", "")) <= 0:
+                add("mqtt_port", "Must be a positive integer")
+        except ValueError:
+            add("mqtt_port", "Must be an integer")
+        if not values.get("topic", "").strip():
+            add("topic", "Must not be blank")
     return errors
 
 
@@ -451,6 +461,21 @@ def _channel_to_json(values: dict) -> dict:
         else:
             ch["port"] = values["modbus_port"]
             ch["baud"] = int(values["modbus_baud"])
+        return ch
+    if values["mode"] == "mqtt":
+        ch = {
+            "code": values["code"], "mode": "mqtt",
+            "host": values["mqtt_host"], "port": int(values["mqtt_port"]),
+            "topic": values["topic"],
+        }
+        if values.get("username"):
+            ch["username"] = values["username"]
+        if values.get("password"):
+            ch["password"] = values["password"]
+        if values.get("json_key"):
+            ch["json_key"] = values["json_key"]
+        if values.get("cmd_topic"):
+            ch["cmd_topic"] = values["cmd_topic"]
         return ch
     ch = {
         "code": values["code"], "mode": "serial", "port": values["port"],
@@ -491,6 +516,8 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
                 if ch.get("conn_type") == "tcp" else ch.get("port", "")
             return "%s unit=%s reg=%s@%s" % (
                 endpoint, ch.get("unit_id"), ch.get("register_type"), ch.get("address"))
+        if mode == "mqtt":
+            return "%s:%s topic=%s" % (ch.get("host", ""), ch.get("port", ""), ch.get("topic", ""))
         return "center=%s" % ch.get("center", "")
 
     rows = ""
@@ -525,9 +552,11 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
           "document.getElementById('serial-fields').style.display="
           "this.value=='serial'?'block':'none';"
           "document.getElementById('modbus-fields').style.display="
-          "this.value=='modbus'?'block':'none';\">"
+          "this.value=='modbus'?'block':'none';"
+          "document.getElementById('mqtt-fields').style.display="
+          "this.value=='mqtt'?'block':'none';\">"
           '<option value="sim">sim</option><option value="serial">serial</option>'
-          '<option value="modbus">modbus</option></select></div>'
+          '<option value="modbus">modbus</option><option value="mqtt">mqtt</option></select></div>'
         + "<fieldset id='sim-fields'><legend>Sim</legend>"
         + field("poll_ms", "Poll (ms)", "500")
         + field("center", "Center", "0")
@@ -571,6 +600,15 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
         + field("scale", "Scale", "1")
         + field("offset", "Offset", "0")
         + field("modbus_poll_ms", "Poll (ms)", "1000")
+        + "</fieldset>"
+        + "<fieldset id='mqtt-fields' style='display:none'><legend>MQTT</legend>"
+        + field("mqtt_host", "Broker host", "127.0.0.1")
+        + field("mqtt_port", "Broker port", "1883")
+        + field("username", "Username (optional)", "")
+        + field("password", "Password (optional)", "", itype="password")
+        + field("topic", "Subscribe topic", "")
+        + field("json_key", "JSON key (blank = raw numeric payload)", "")
+        + field("cmd_topic", "Publish topic for commands (blank = <topic>/cmd)", "")
         + "</fieldset>"
         + "<button type='submit'>Add channel</button></form>"
     )
@@ -671,7 +709,8 @@ async def channels_post(request: Request):
                    "value_group", "stable_group", "stable_ok", "cmd_zero", "cmd_tare",
                    "conn_type", "host", "tcp_port", "modbus_port", "modbus_baud",
                    "unit_id", "register_type", "address", "data_type", "scale",
-                   "offset", "modbus_poll_ms")}
+                   "offset", "modbus_poll_ms", "mqtt_host", "mqtt_port", "username",
+                   "password", "topic", "json_key", "cmd_topic")}
         existing_codes = {c.get("code") for c in channels}
         errors = _validate_channel(values, existing_codes)
         if errors:
