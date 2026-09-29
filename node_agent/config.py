@@ -39,12 +39,23 @@ class Settings:
     submit_interval_s: float = float(os.environ.get("NODE_SUBMIT_INTERVAL_S", "2"))
     command_poll_interval_s: float = float(os.environ.get("NODE_COMMAND_POLL_INTERVAL_S", "2"))
 
+    # De trong host = uplink giu nguyen HTTP (legacy). Dat host de chuyen
+    # measurements+command sang MQTT (mirror ESP32 mqtt_link.c) - xem mqtt_uplink.py.
+    mqtt_uplink_host: str = os.environ.get("NODE_MQTT_UPLINK_HOST", "")
+    mqtt_uplink_port: int = _int("NODE_MQTT_UPLINK_PORT", 1883)
+    mqtt_uplink_username: str = os.environ.get("NODE_MQTT_UPLINK_USERNAME", "")
+    mqtt_uplink_password: str = os.environ.get("NODE_MQTT_UPLINK_PASSWORD", "")
+
     setup_port: int = _int("NODE_SETUP_PORT", 8091)
     setup_token: str = os.environ.get("NODE_SETUP_TOKEN", "")
 
     def __post_init__(self):
         self.state_dir = Path(self.state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def mqtt_uplink_enabled(self) -> bool:
+        return bool(self.mqtt_uplink_host.strip())
 
     @property
     def state_json_path(self) -> Path:

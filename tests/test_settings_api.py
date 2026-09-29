@@ -49,6 +49,13 @@ def _valid_env_form():
         "NODE_HEARTBEAT_INTERVAL_S": "30",
         "NODE_SUBMIT_INTERVAL_S": "2",
         "NODE_COMMAND_POLL_INTERVAL_S": "2",
+        # MQTT uplink (2026-09-29) - form THAT luon submit gia tri hien tai cua
+        # input (kem ca default "1883" pre-fill qua _render_field), giu dung
+        # shape do o day.
+        "NODE_MQTT_UPLINK_HOST": "",
+        "NODE_MQTT_UPLINK_PORT": "1883",
+        "NODE_MQTT_UPLINK_USERNAME": "",
+        "NODE_MQTT_UPLINK_PASSWORD": "",
         "NODE_SETUP_TOKEN": "",
     }
 
@@ -148,12 +155,55 @@ def _valid_values():
         "NODE_HEARTBEAT_INTERVAL_S": "30",
         "NODE_SUBMIT_INTERVAL_S": "2",
         "NODE_COMMAND_POLL_INTERVAL_S": "2",
+        "NODE_MQTT_UPLINK_HOST": "",
+        "NODE_MQTT_UPLINK_PORT": "1883",
+        "NODE_MQTT_UPLINK_USERNAME": "",
+        "NODE_MQTT_UPLINK_PASSWORD": "",
         "NODE_SETUP_TOKEN": "",
     }
 
 
 def test_validate_accepts_happy_path_values():
     assert settings_api._validate(_valid_values()) == {}
+
+
+def test_validate_skips_mqtt_uplink_port_check_when_host_blank():
+    """Fix 2026-09-29 (theo finding tu test-writer): NODE_MQTT_UPLINK_PORT
+    CHI con bat buoc la so nguyen duong KHI NODE_MQTT_UPLINK_HOST co gia tri
+    (MQTT uplink dang BAT). Host rong (mqtt_uplink_enabled == False) -> port
+    rong/khong hop le KHONG con bi reject nua - client POST /setup truc tiep
+    (script, khong qua form HTML) bo qua field nay khi khong dung MQTT se
+    khong bi 400 oan nhu truoc (xem Fix-History/finding cu)."""
+    values = _valid_values()
+    values["NODE_MQTT_UPLINK_HOST"] = ""
+    values["NODE_MQTT_UPLINK_PORT"] = ""
+
+    errors = settings_api._validate(values)
+
+    assert "NODE_MQTT_UPLINK_PORT" not in errors
+
+
+def test_validate_still_rejects_invalid_port_when_host_set():
+    """Doi chung voi test tren: khi MQTT uplink DANG BAT (host co gia tri),
+    port van phai la so nguyen duong hop le - fix tren chi bo check LUC TAT,
+    khong duoc lam mat validate luc BAT."""
+    values = _valid_values()
+    values["NODE_MQTT_UPLINK_HOST"] = "broker.local"
+    values["NODE_MQTT_UPLINK_PORT"] = ""
+
+    errors = settings_api._validate(values)
+
+    assert "NODE_MQTT_UPLINK_PORT" in errors
+
+
+def test_validate_accepts_mqtt_uplink_enabled_with_valid_host_and_port():
+    values = _valid_values()
+    values["NODE_MQTT_UPLINK_HOST"] = "broker.local"
+    values["NODE_MQTT_UPLINK_PORT"] = "8883"
+    values["NODE_MQTT_UPLINK_USERNAME"] = "node01"
+    values["NODE_MQTT_UPLINK_PASSWORD"] = "secret"      # secret-allow: test fixture, khong phai credential that
+
+    assert settings_api._validate(values) == {}
 
 
 def test_validate_rejects_url_without_scheme():

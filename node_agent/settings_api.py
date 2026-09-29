@@ -58,12 +58,20 @@ _FIELDS = [
     {"key": "NODE_HEARTBEAT_INTERVAL_S", "label": "Heartbeat interval (s)", "default": "30", "hint": ""},
     {"key": "NODE_SUBMIT_INTERVAL_S", "label": "Submit interval (s)", "default": "2", "hint": ""},
     {"key": "NODE_COMMAND_POLL_INTERVAL_S", "label": "Command poll interval (s)", "default": "2", "hint": ""},
+    {"key": "NODE_MQTT_UPLINK_HOST", "label": "MQTT uplink broker host", "default": "",
+     "hint": "Leave blank = uplink stays HTTP-only (legacy). Set to switch measurements+command "
+             "to MQTT, mirroring the ESP32 firmware (lower realtime display latency)."},
+    {"key": "NODE_MQTT_UPLINK_PORT", "label": "MQTT uplink broker port", "default": "1883", "hint": ""},
+    {"key": "NODE_MQTT_UPLINK_USERNAME", "label": "MQTT uplink username", "default": "",
+     "hint": "Shared broker credential (not per-device, same as ESP32 firmware)"},
+    {"key": "NODE_MQTT_UPLINK_PASSWORD", "label": "MQTT uplink password", "default": "",  # secret-allow
+     "hint": "", "input_type": "password"},
     {"key": "NODE_SETUP_TOKEN", "label": "Setup access token", "default": "",
      "hint": "Leave blank = no gating (LAN-only). Set a value to require HTTP "
              "Basic Auth (any username, password = this token) for all of /setup.",
      "input_type": "password"},
 ]
-_INT_FIELDS = {"NODE_HELLO_INTERVAL_S", "NODE_HEARTBEAT_INTERVAL_S"}
+_INT_FIELDS = {"NODE_HELLO_INTERVAL_S", "NODE_HEARTBEAT_INTERVAL_S", "NODE_MQTT_UPLINK_PORT"}
 _FLOAT_FIELDS = {"NODE_SUBMIT_INTERVAL_S", "NODE_COMMAND_POLL_INTERVAL_S"}
 
 _CSS = """
@@ -191,6 +199,8 @@ def _validate(values: dict) -> Dict[str, List[str]]:
     if not values.get("NODE_SERIAL", "").strip():
         add("NODE_SERIAL", "Must not be blank")
     for key in _INT_FIELDS:
+        if key == "NODE_MQTT_UPLINK_PORT" and not values.get("NODE_MQTT_UPLINK_HOST", "").strip():
+            continue          # MQTT uplink tat (host rong, xem Settings.mqtt_uplink_enabled) - port khong bat buoc
         try:
             if int(values.get(key, "")) <= 0:
                 add(key, "Must be a positive integer")

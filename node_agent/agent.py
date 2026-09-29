@@ -14,6 +14,7 @@ import uuid
 
 from .config import settings
 from .edge_client import EdgeClient
+from .mqtt_uplink import MqttUplink
 from .readers.gpio import GpioReader
 from .readers.modbus import ModbusReader
 from .readers.mqtt import MqttReader
@@ -40,6 +41,18 @@ class NodeAgent:
     def __init__(self):
         self.store = Store(settings.sqlite_path)
         self.client = EdgeClient(self.store)
+        # None = giu HTTP (legacy, NODE_MQTT_UPLINK_HOST bo trong). Chi start()
+        # sau khi _hello_loop bao thanh cong lan dau - xem mqtt_uplink.py.
+        self.mqtt = MqttUplink(self.store) if settings.mqtt_uplink_enabled else None
+        self._mqtt_started = threading.Event()
+        # "Kick" thay vi cho het timer co dinh - khop pattern ESP32
+        # (xTaskNotifyGive/ulTaskNotifyTake trong mqtt_link.c: FLUSH_MS chi la
+        # fallback, du lieu moi den la day di publish NGAY). Ap dung cho CA HTTP
+        # lan MQTT (dung chung _flush_loop/_sender_loop) - giam do tre hien thi
+        # realtime, khong doi hanh vi batch (van gom moi thu tich luy trong
+        # khoang thoi gian rat ngan giua luc kick va luc doc queue).
+        self._flush_kick = threading.Event()
+        self._sender_kick = threading.Event()
         self._pending: "queue.Queue" = queue.Queue()
         self._readers: dict = {}
         self._stop = threading.Event()
@@ -53,6 +66,7 @@ class NodeAgent:
     def _emit(self, ch, v, s, q, stable):
         self._pending.put_nowait({"ch": ch, "v": v, "s": s, "q": int(q or 0), "stable": stable,
                                   "ts": int(time.time() * 1000)})
+        self._flush_kick.set()
 
     def _build_readers(self):
         for cfg in settings.load_channels():
@@ -114,8 +128,16 @@ class NodeAgent:
 
     def stop(self):
         self._stop.set()
+        # _flush_loop/_sender_loop gio cho _flush_kick/_sender_kick (khac
+        # self._stop) - phai tu danh thuc rieng, khong thi phai doi het not
+        # submit_interval_s/1.0s con lai moi quay lai kiem duoc self._stop.is_set()
+        # (python-reviewer 2026-09-29 bat finding nay).
+        self._flush_kick.set()
+        self._sender_kick.set()
         for r in set(self._readers.values()):
             r.stop()
+        if self.mqtt and self._mqtt_started.is_set():
+            self.mqtt.stop()
         for t in self._threads:
             t.join(timeout=5)
 
@@ -137,11 +159,22 @@ class NodeAgent:
             res = self.client.hello()
             if not res.get("ok"):
                 _logger.info("hello that bai: %s", res.get("error"))
+            elif self.mqtt and not self._mqtt_started.is_set():
+                # Chi mo MQTT SAU KHI hello 200 - edge phai cache api_key
+                # TRUOC thi moi verify duoc chu ky cua message MQTT dau tien.
+                self.mqtt.start()
+                self._mqtt_started.set()
             self._stop.wait(settings.hello_interval_s)
 
     def _flush_loop(self):
         while not self._stop.is_set():
-            self._stop.wait(settings.submit_interval_s)
+            # submit_interval_s la TRAN CHO (khong con reading nao thi van
+            # flush dinh ky nhu cu); _flush_kick lam _emit() danh thuc NGAY
+            # khi co reading moi, khong con phai doi het tran timer roi moi
+            # kiem tra queue - giam do tre hien thi realtime cho ca HTTP lan
+            # MQTT (khop pattern kick cua ESP32, xem ghi chu __init__).
+            self._flush_kick.wait(settings.submit_interval_s)
+            self._flush_kick.clear()
             items = []
             while True:
                 try:
@@ -151,20 +184,27 @@ class NodeAgent:
             if items:
                 seq = self.store.next_seq()
                 self.store.outbox_push(self._boot_id, seq, {"items": items})
+                self._sender_kick.set()
 
     def _sender_loop(self):
         backoff_s = 0.0
         while not self._stop.is_set():
             row = self.store.outbox_oldest()
             if not row:
-                self._stop.wait(1.0)
+                self._sender_kick.wait(1.0)
+                self._sender_kick.clear()
                 continue
-            res = self.client.measurements(row["payload"]["items"], row["bid"], row["seq"])
-            if res.get("ok"):
+            if self.mqtt:
+                ok = self.mqtt.measurements(row["payload"]["items"], row["bid"], row["seq"])
+                err = "khong nhan PUBACK" if not ok else None
+            else:
+                res = self.client.measurements(row["payload"]["items"], row["bid"], row["seq"])
+                ok, err = res.get("ok"), res.get("error")
+            if ok:
                 self.store.outbox_delete(row["id"])
                 backoff_s = 0.0
             else:
-                _logger.info("gui measurements that bai: %s", res.get("error"))
+                _logger.info("gui measurements that bai: %s", err)
                 backoff_s = min(_SENDER_BACKOFF_MAX_S,
                                 backoff_s * 2 if backoff_s else _SENDER_BACKOFF_MIN_S)
                 self._stop.wait(backoff_s + backoff_s * 0.2 * random.random())
@@ -186,13 +226,17 @@ class NodeAgent:
         # lenh that su.
         last_ok_cmd_id = None
         while not self._stop.is_set():
-            res = self.client.next_command()
-            cmd = res.get("command")
+            if self.mqtt:
+                # queue.get(timeout=...) da tu cho toi da command_poll_interval_s,
+                # KHONG can them _stop.wait() rieng o nhanh nay.
+                cmd = self.mqtt.next_command(settings.command_poll_interval_s)
+            else:
+                cmd = self.client.next_command().get("command")
             if cmd:
                 cmd_id = cmd["id"]
                 if cmd_id == last_ok_cmd_id:
                     _logger.info("lenh %s da thuc thi roi, chi ack lai", cmd_id)
-                    self.client.ack_command(cmd_id, True, "")
+                    self._ack_command(cmd_id, True, "")
                     continue
                 reader = self._readers.get(cmd["channel"])
                 result = (reader.command(cmd["cmd"], cmd.get("value"), channel=cmd["channel"]) if reader
@@ -200,9 +244,16 @@ class NodeAgent:
                 ok = result.get("ok", False)
                 if ok:
                     last_ok_cmd_id = cmd_id
-                self.client.ack_command(cmd_id, ok, result.get("error") or "")
+                self._ack_command(cmd_id, ok, result.get("error") or "")
                 continue          # kiem tra ngay lenh ke tiep, khong cho
-            self._stop.wait(settings.command_poll_interval_s)
+            if not self.mqtt:
+                self._stop.wait(settings.command_poll_interval_s)
+
+    def _ack_command(self, cmd_id: int, ok: bool, detail: str):
+        if self.mqtt:
+            self.mqtt.ack_command(cmd_id, ok, detail)
+        else:
+            self.client.ack_command(cmd_id, ok, detail)
 
     def _setup_server_loop(self):
         # uvicorn tu quan ly asyncio loop rieng trong thread nay - phan con
