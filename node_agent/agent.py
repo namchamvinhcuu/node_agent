@@ -299,7 +299,10 @@ class NodeAgent:
                     continue
                 reader = self._readers.get(cmd["channel"])
                 try:
-                    result = (reader.command(cmd["cmd"], cmd.get("value"), channel=cmd["channel"]) if reader
+                    # ms/period_ms (GPIO output: bat-tu-tat / nhay) chi truyen
+                    # khi lenh co - giu nguyen dang goi cu cho moi lenh khac.
+                    opts = {k: cmd[k] for k in ("ms", "period_ms") if cmd.get(k) is not None}
+                    result = (reader.command(cmd["cmd"], cmd.get("value"), channel=cmd["channel"], **opts) if reader
                               else {"ok": False, "error": "khong co kenh %s tren node nay" % cmd["channel"]})
                 except Exception as exc:                            # noqa: BLE001
                     _logger.exception("lenh %s: reader.command() raise", cmd_id)

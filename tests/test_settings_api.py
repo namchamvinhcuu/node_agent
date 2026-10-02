@@ -462,7 +462,9 @@ def test_validate_channel_rejects_modbus_invalid_data_type():
 
 
 def test_validate_channel_rejects_modbus_invalid_register_type():
-    values = _valid_modbus_tcp_values(register_type="coil")
+    # "coil" da hop le tu pcm-downlink-command (2026-10-02) - dung gia tri
+    # sai khac de giu y nghia test.
+    values = _valid_modbus_tcp_values(register_type="discrete")
     errors = settings_api._validate_channel(values, existing_codes=set())
     assert "register_type" in errors
 

@@ -53,7 +53,7 @@ import threading
 
 from pymodbus.client import ModbusSerialClient, ModbusTcpClient
 
-from .base import ChannelReader
+from .base import ChannelReader, onoff_level
 
 _logger = logging.getLogger("node.reader.modbus")
 
@@ -147,6 +147,12 @@ class _SharedModbusClient:
     def write_registers(self, *args, **kwargs):
         return self._call("write_registers", *args, **kwargs)
 
+    def read_coils(self, *args, **kwargs):
+        return self._call("read_coils", *args, **kwargs)
+
+    def write_coil(self, *args, **kwargs):
+        return self._call("write_coil", *args, **kwargs)
+
 
 def _get_shared_client(key, factory):
     with _registry_lock:
@@ -224,7 +230,13 @@ class ModbusReader(ChannelReader):
         self._client = None
         self._unit = int(cfg.get("unit_id", 1) or 1)
         self._address = int(cfg.get("address", 0))
-        self._register_type = cfg.get("register_type", "holding")
+        # Normalize: channels.json sua tay co the ghi "Holding"/" holding"/null
+        # - truoc khi co validate nhung gia tri do van doc nhu holding, khong
+        # duoc lam roi kenh dang chay.
+        self._register_type = str(cfg.get("register_type") or "holding").strip().lower()
+        if self._register_type not in ("holding", "input", "coil"):
+            raise ValueError("register_type phai la holding, input hoac coil, khong phai %r"
+                             % self._register_type)
         # Approach B (2026-09-25): a Modbus source can now have MULTIPLE
         # points ("points" in channels.json), read together in a single
         # request - confirmed on real hardware (OrangePi3B): an RS485
@@ -238,7 +250,12 @@ class ModbusReader(ChannelReader):
         # values are unchanged from before Approach B.
         points_cfg = cfg.get("points") or [cfg]
         self._points = [_parse_point(p) for p in points_cfg]
-        self._count = max(p["reg_offset"] + p["width"] for p in self._points)
+        if self._register_type == "coil":
+            # Coil (FC01 doc / FC05 ghi) la 1 BIT moi dia chi - data_type/
+            # scale/offset khong ap dung, moi point chiem dung 1 coil.
+            for p in self._points:
+                p["width"] = 1
+        self._count =max(p["reg_offset"] + p["width"] for p in self._points)
         # Ep kieu NGAY o __init__ (duoc agent.py::_build_readers() boc
         # try/except) thay vi doc lai tu self.cfg trong _run() - _run() chay
         # tren thread TRAN khong duoc Agent._guarded() bao ve, channels.json
@@ -271,6 +288,12 @@ class ModbusReader(ChannelReader):
         using "points", preserving the old behavior). Only 1 request per
         loop iteration whether there's 1 or N points - fewer round-trips on
         the physical bus."""
+        if self._register_type == "coil":
+            rr = self._client.read_coils(self._address, count=self._count, device_id=self._unit)
+            if rr.isError():
+                raise IOError(str(rr))
+            # rr.bits duoc pad toi boi so cua 8 - chi lay dung vi tri cua point.
+            return [(p["code"], 1.0 if rr.bits[p["reg_offset"]] else 0.0) for p in self._points]
         if self._register_type == "input":
             rr = self._client.read_input_registers(self._address, count=self._count, device_id=self._unit)
         else:
@@ -349,8 +372,20 @@ class ModbusReader(ChannelReader):
             self._client.release()
             self._client = None
 
-    def command(self, cmd: str, value=None, channel: str = None) -> dict:
-        if cmd != "write" or value is None:
+    def command(self, cmd: str, value=None, channel: str = None, **opts) -> dict:
+        coil = self._register_type == "coil"
+        if coil:
+            # Coil: on/off nhu relay (FC05), write value != 0 -> bat - cung
+            # ngu nghia GPIO output (readers/gpio.py) va ESP32 gpio_out.
+            if cmd in ("on", "off"):
+                level = cmd == "on"
+            elif cmd == "write":
+                level = onoff_level(value)
+                if level is None:
+                    return {"ok": False, "error": "write can value so (khac 0 = bat)"}
+            else:
+                return {"ok": False, "error": "coil chi ho tro on | off | write"}
+        elif cmd != "write" or value is None:
             return {"ok": False, "error": "modbus chi ho tro cmd=write kem value"}
         if self._register_type == "input":
             return {"ok": False, "error": "input register la read-only, khong ghi duoc"}
@@ -368,9 +403,14 @@ class ModbusReader(ChannelReader):
         if not self._client:
             return {"ok": False, "error": "chua ket noi toi thiet bi"}
         try:
+            address = self._address + point["reg_offset"]
+            if coil:
+                resp = self._client.write_coil(address, level, device_id=self._unit)
+                if resp.isError():
+                    return {"ok": False, "error": str(resp)}
+                return {"ok": True, "status": "ok"}
             raw = (float(value) - point["offset"]) / point["scale"]
             regs = _encode(point["data_type"], raw)
-            address = self._address + point["reg_offset"]
             if len(regs) == 1:
                 resp = self._client.write_register(address, regs[0], device_id=self._unit)
             else:

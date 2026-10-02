@@ -438,8 +438,8 @@ def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]
                 add("unit_id", "Must be a positive integer")
         except ValueError:
             add("unit_id", "Must be an integer")
-        if values.get("register_type") not in ("holding", "input"):
-            add("register_type", "Must be holding or input")
+        if values.get("register_type") not in ("holding", "input", "coil"):
+            add("register_type", "Must be holding, input or coil")
         try:
             if int(values.get("address", "")) < 0:
                 add("address", "Must be a non-negative integer")
@@ -473,6 +473,8 @@ def _validate_channel(values: dict, existing_codes: set) -> Dict[str, List[str]]
                 add("pin", "Must be a non-negative integer")
         except ValueError:
             add("pin", "Must be an integer")
+        if values.get("direction") not in ("", "input", "output"):
+            add("direction", "Must be input or output")
         if values.get("pull_up") not in ("true", "false"):
             add("pull_up", "Must be true or false")
         if values.get("invert") not in ("true", "false"):
@@ -586,6 +588,7 @@ def _channel_to_json(values: dict) -> dict:
     if values["mode"] == "gpio":
         return {
             "code": values["code"], "mode": "gpio", "pin": int(values["pin"]),
+            "direction": values.get("direction") or "input",
             "pull_up": values["pull_up"] == "true", "invert": values["invert"] == "true",
             "bounce_ms": int(values.get("bounce_ms") or 0),
             "poll_ms": int(values["gpio_poll_ms"]),
@@ -634,8 +637,8 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
         if mode == "mqtt":
             return "%s:%s topic=%s" % (ch.get("host", ""), ch.get("port", ""), ch.get("topic", ""))
         if mode == "gpio":
-            return "pin=%s pull_up=%s invert=%s" % (
-                ch.get("pin"), ch.get("pull_up"), ch.get("invert"))
+            return "pin=%s %s pull_up=%s invert=%s" % (
+                ch.get("pin"), ch.get("direction", "input"), ch.get("pull_up"), ch.get("invert"))
         return "center=%s" % ch.get("center", "")
 
     def _channel_row(code: str, mode: str, detail: str) -> str:
@@ -729,7 +732,7 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
         + field("modbus_baud", "Baud", "9600")
         + "</div>"
         + field("unit_id", "Unit id (slave address)", "1")
-        + field("register_type", "Register type (holding/input)", "holding")
+        + field("register_type", "Register type (holding/input/coil)", "holding")
         + field("address", "Register address", "0")
         + field("data_type", "Data type (u16/i16/u32/i32/f32)", "u16")
         + field("scale", "Scale", "1")
@@ -747,6 +750,7 @@ def _render_channels(errors=None, saved=False, deleted=False) -> HTMLResponse:
         + "</fieldset>"
         + "<fieldset id='gpio-fields' style='display:none'><legend>GPIO</legend>"
         + field("pin", "GPIO pin (BCM numbering)", "4")
+        + field("direction", "Direction (input/output - output = relay/lamp controlled from Odoo)", "input")
         + field("pull_up", "Pull up (true/false)", "false")
         + field("invert", "Invert reading (true/false)", "false")
         + field("bounce_ms", "Debounce (ms, 0 = off)", "0")
@@ -898,7 +902,7 @@ async def channels_post(request: Request):
                    "conn_type", "host", "tcp_port", "modbus_port", "modbus_baud",
                    "unit_id", "register_type", "address", "data_type", "scale",
                    "offset", "modbus_poll_ms", "mqtt_host", "mqtt_port", "username",
-                   "password", "topic", "json_key", "cmd_topic", "pin", "pull_up",
+                   "password", "topic", "json_key", "cmd_topic", "pin", "direction", "pull_up",
                    "invert", "bounce_ms", "gpio_poll_ms")}
         errors = _validate_channel(values, _all_codes(channels))
         if errors:
