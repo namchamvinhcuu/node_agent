@@ -2,6 +2,7 @@
 """Client goi VAO edge - dung hop dong node_api.py (edge_collector). Dong bo
 (requests) vi node chi can mot vong lap tuan tu don gian, khong can asyncio."""
 import logging
+import time
 
 import requests
 
@@ -27,6 +28,9 @@ class EdgeClient:
     def __init__(self, store: Store):
         self.store = store
         self.session = requests.Session()
+        # gio edge - gio node (giay), hoc tu server_time_ms cua /hello: "ts"
+        # cua lenh xuong la gio EDGE, node khong co NTP se tu choi nham "stale".
+        self.clock_offset_s = 0.0
 
     @property
     def api_key(self):
@@ -67,6 +71,9 @@ class EdgeClient:
         # gap ("sai X-API-Key" lap vinh vien tren chinh /hello).
         res = self._post("/node/v1/hello", {"name": settings.name, "kind": settings.kind},
                          include_key=False)
+        server_ms = res.get("server_time_ms")
+        if res.get("ok") and isinstance(server_ms, (int, float)) and not isinstance(server_ms, bool):
+            self.clock_offset_s = server_ms / 1000.0 - time.time()
         if res.get("ok") and res.get("api_key") and res["api_key"] != self.api_key:
             self.store.kv_set("api_key", res["api_key"])
             _logger.info("da nhan/cap nhat api_key tu edge (Odoo da biet thiet bi nay)")
@@ -81,5 +88,8 @@ class EdgeClient:
     def next_command(self) -> dict:
         return self._get("/node/v1/commands")
 
-    def ack_command(self, cmd_id: int, ok: bool, detail: str = "") -> dict:
-        return self._post("/node/v1/commands/ack", {"id": cmd_id, "ok": ok, "detail": detail})
+    def ack_command(self, cmd_id: int, ok: bool, detail: str = "", request_id: str = None) -> dict:
+        body = {"id": cmd_id, "ok": ok, "detail": detail}
+        if request_id:
+            body["request_id"] = request_id
+        return self._post("/node/v1/commands/ack", body)

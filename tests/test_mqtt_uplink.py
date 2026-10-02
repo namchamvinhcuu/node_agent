@@ -17,10 +17,11 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import paho.mqtt.client as mqtt
+import pytest
 
 import node_agent.config as config_module
 import node_agent.mqtt_uplink as mqtt_uplink_module
-from node_agent.mqtt_uplink import MqttUplink, sign
+from node_agent.mqtt_uplink import MqttUplink, sign, verify
 
 
 class _FakeMqttClient:
@@ -284,3 +285,168 @@ def test_next_command_returns_none_on_empty_queue_timeout(monkeypatch):
     uplink, _ = _make_uplink(monkeypatch)
 
     assert uplink.next_command(0.05) is None
+
+
+# ----------------------------------------------------------------------
+# 5) pcm-downlink-command (2026-10-02): verify() lenh xuong, "sig_cmd" trong
+#    status connect-time, ack_command echo request_id
+
+_VKEY = "k-verify"  # secret-allow (test fixture)
+
+
+def _signed_cmd(key=_VKEY):
+    payload = {"id": 5, "request_id": "R-5", "channel": "a", "cmd": "w", "value": 1, "ts": 1700000000}
+    return dict(payload, sig=sign(key, payload))
+
+
+def test_verify_accepts_valid_signature():
+    assert verify(_VKEY, _signed_cmd()) is True
+
+
+def test_verify_is_key_order_independent():
+    cmd = _signed_cmd()
+    reordered = dict(reversed(list(cmd.items())))
+    assert verify(_VKEY, reordered) is True
+
+
+def test_verify_rejects_missing_sig():
+    cmd = _signed_cmd()
+    del cmd["sig"]
+    assert verify(_VKEY, cmd) is False
+
+
+def test_verify_rejects_non_string_sig():
+    cmd = _signed_cmd()
+    cmd["sig"] = 0
+    assert verify(_VKEY, cmd) is False
+
+
+def test_verify_rejects_tampered_field():
+    cmd = _signed_cmd()
+    cmd["value"] = 2
+    assert verify(_VKEY, cmd) is False
+
+
+def test_verify_rejects_added_field_after_signing():
+    cmd = _signed_cmd()
+    cmd["period_ms"] = 10
+    assert verify(_VKEY, cmd) is False
+
+
+def test_verify_rejects_wrong_key():
+    assert verify("khoa-khac", _signed_cmd()) is False
+
+
+@pytest.mark.parametrize("key", ["", None])
+def test_verify_rejects_when_no_key_learned(key):
+    assert verify(key, _signed_cmd()) is False
+
+
+def test_on_connect_status_announces_sig_cmd_capability_when_key_known(monkeypatch):
+    uplink, fake = _make_uplink(monkeypatch)
+    fake.auto_ack = False
+
+    uplink._on_connect(fake, None, None, 0)
+
+    body = json.loads(fake.published[0][1])
+    assert body["sig_cmd"] is True
+    assert body["cmd"] is True and body["online"] is True
+    assert uplink.sig_cmd is True
+    unsigned = {k: v for k, v in body.items() if k != "sig"}
+    assert body["sig"] == sign("secretkey123", unsigned)  # secret-allow (test fixture)
+
+
+@pytest.mark.parametrize("key", [None, ""])
+def test_on_connect_without_key_omits_sig_cmd_and_is_unsigned(monkeypatch, key):
+    """/hello co the tra ok ma api_key=None (Odoo chua tao pcm.device) - khai
+    sig_cmd luc do thi edge khong co key de ky, moi lenh bi tu choi."""
+    uplink, fake = _make_uplink(monkeypatch, api_key=key)
+    fake.auto_ack = False
+
+    uplink._on_connect(fake, None, None, 0)
+
+    body = json.loads(fake.published[0][1])
+    assert body == {"online": True, "cmd": True}
+    assert uplink.sig_cmd is False
+
+
+def test_sig_cmd_default_false_and_tracks_key_on_each_reconnect(monkeypatch):
+    uplink, fake = _make_uplink(monkeypatch, api_key=None)
+    assert uplink.sig_cmd is False
+    fake.auto_ack = False
+
+    uplink._on_connect(fake, None, None, 0)
+    assert uplink.sig_cmd is False
+
+    # reconnect sau khi da co key -> _on_connect tu khai lai (key hoc GIUA
+    # phien thi announce_sig_cmd() lo, xem test ben duoi)
+    uplink.store.kv_get.return_value = "khoa-moi"  # secret-allow (test fixture)
+    uplink._on_connect(fake, None, None, 0)
+    assert uplink.sig_cmd is True
+    assert json.loads(fake.published[-1][1])["sig_cmd"] is True
+
+
+def test_ack_command_echoes_request_id_when_present(monkeypatch):
+    uplink, fake = _make_uplink(monkeypatch)
+
+    assert uplink.ack_command(42, False, "sig_invalid", request_id="R-42") is True
+
+    body = json.loads(fake.published[0][1])
+    assert body["request_id"] == "R-42"
+    assert body["id"] == 42 and body["ok"] is False and body["detail"] == "sig_invalid"
+
+
+@pytest.mark.parametrize("rid", [None, ""])
+def test_ack_command_omits_request_id_when_absent(monkeypatch, rid):
+    uplink, fake = _make_uplink(monkeypatch)
+
+    uplink.ack_command(42, True, "", request_id=rid)
+
+    body = json.loads(fake.published[0][1])
+    assert "request_id" not in body
+
+
+# ----------------------------------------------------------------------
+# 6) Vong 3 (2026-10-02, regression finding reviewer): key hoc GIUA phien
+#    MQTT -> announce_sig_cmd() khai lai status, chi bat sig_cmd sau PUBACK
+
+def test_announce_sig_cmd_without_key_returns_false_and_publishes_nothing(monkeypatch):
+    uplink, fake = _make_uplink(monkeypatch, api_key=None)
+
+    assert uplink.announce_sig_cmd() is False
+
+    assert fake.published == []
+    assert uplink.sig_cmd is False
+
+
+def test_announce_sig_cmd_publish_not_connected_keeps_false(monkeypatch):
+    uplink, fake = _make_uplink(monkeypatch)
+    fake.publish_rc = mqtt.MQTT_ERR_NO_CONN
+
+    assert uplink.announce_sig_cmd() is False
+
+    assert uplink.sig_cmd is False
+
+
+def test_announce_sig_cmd_no_puback_keeps_false(monkeypatch):
+    uplink, fake = _make_uplink(monkeypatch)
+    fake.auto_ack = False
+    monkeypatch.setattr(mqtt_uplink_module, "_ACK_TIMEOUT_S", 0.05)
+
+    assert uplink.announce_sig_cmd() is False
+
+    assert uplink.sig_cmd is False
+
+
+def test_announce_sig_cmd_ok_publishes_signed_retained_status(monkeypatch):
+    uplink, fake = _make_uplink(monkeypatch)
+
+    assert uplink.announce_sig_cmd() is True
+
+    assert uplink.sig_cmd is True
+    topic, payload, qos, retain = fake.published[0]
+    assert topic == uplink._topic_status and retain is True and qos == 1
+    body = json.loads(payload)
+    unsigned = {k: v for k, v in body.items() if k != "sig"}
+    assert unsigned == {"online": True, "cmd": True, "sig_cmd": True}
+    assert body["sig"] == sign("secretkey123", unsigned)  # secret-allow (test fixture)

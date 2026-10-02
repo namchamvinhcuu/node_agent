@@ -20,6 +20,7 @@ from unittest.mock import Mock
 import node_agent.agent as agent_module
 import node_agent.config as config_module
 from node_agent.agent import NodeAgent
+from node_agent.mqtt_uplink import sign
 
 
 class _FakeThread:
@@ -244,10 +245,18 @@ def test_command_loop_mqtt_dedup_by_exact_id_only_acks_again(monkeypatch, tmp_pa
     reader.command.return_value = {"ok": True}
     agent._readers = {"a": reader}
     agent.mqtt = Mock()
+    agent.mqtt.sig_cmd = True   # node da khai "sig_cmd" luc connect -> bat buoc ky
+    # Tu 2026-10-02 nhanh MQTT BAT BUOC ky (node khai "sig_cmd": true) - lenh
+    # trong test phai ky dung bang api_key node da hoc + ts hop le, neu khong
+    # se bi tu choi "sig_invalid" truoc khi toi buoc dedup.
+    key = "k-test-mqtt"  # secret-allow (test fixture)
+    agent.store.kv_set("api_key", key)
+    unsigned = {"id": 300, "channel": "a", "cmd": "write", "value": 1, "ts": int(time.time())}
+    signed = dict(unsigned, sig=sign(key, unsigned))
 
     remaining = iter([
-        {"id": 300, "channel": "a", "cmd": "write", "value": 1},
-        {"id": 300, "channel": "a", "cmd": "write", "value": 1},   # redelivery
+        dict(signed),
+        dict(signed),   # redelivery
     ])
 
     def fake_next_command(timeout):

@@ -12,7 +12,9 @@ LWT thi client da mat ket noi, khong the ky dong duoc) de edge phat hien node
 "chet" ngay khi mat TCP, nhanh hon heartbeat polling nhieu (khop pattern ESP32).
 Sau khi connect thanh cong, tu publish {"online": true, "cmd": true} (retain)
 de bao caps "nghe lenh qua MQTT" cho manager.queue_command ben edge chon dung
-duong publish truc tiep thay vi roi ve poll-queue.
+duong publish truc tiep thay vi roi ve poll-queue. "sig_cmd": true bao edge
+node nay VERIFY chu ky lenh xuong (xem verify()), chi khai khi luc connect da
+co api_key - edge CHI ky lenh khi thay co nay (ESP32 cu chi co buffer 192B, ky moi luc se cat goi).
 
 Ky HMAC-SHA256 bang api_key da hoc qua /hello cho MOI message CO THE ky dong
 luc dang chay (meas/status-online/cmdack) - ESP32 dung chung 1 broker
@@ -61,6 +63,17 @@ def sign(api_key: str, payload: dict) -> str:
     return hmac.new(api_key.encode(), _canonical(payload), hashlib.sha256).hexdigest()
 
 
+def verify(api_key: str, payload: dict) -> bool:
+    """Chieu nguoc cua sign() cho lenh XUONG tu edge (thong nhat voi session
+    edge-collector-58, 2026-10-02): sig = HMAC tren canonical JSON cua payload
+    BO 'sig'. compare_digest de khong lo thoi gian so sanh."""
+    sig = payload.get("sig")
+    if not api_key or not isinstance(sig, str):
+        return False
+    rest = {k: v for k, v in payload.items() if k != "sig"}
+    return hmac.compare_digest(sign(api_key, rest), sig)
+
+
 class MqttUplink:
     def __init__(self, store: Store):
         self.store = store
@@ -69,6 +82,9 @@ class MqttUplink:
         self._topic_cmd = "fms/%s/cmd" % settings.serial
         self._topic_cmd_ack = "fms/%s/cmdack" % settings.serial
         self._cmd_queue: "queue.Queue" = queue.Queue()
+        # Da khai "sig_cmd" trong status cua phien MQTT hien tai chua - agent.py
+        # chi BAT BUOC lenh co chu ky khi co nay True (khop ESP32 esp32-90).
+        self.sig_cmd = False
         self._cli = mqtt.Client(client_id=settings.serial, clean_session=True)
         if settings.mqtt_uplink_username:
             self._cli.username_pw_set(settings.mqtt_uplink_username, settings.mqtt_uplink_password)
@@ -97,7 +113,15 @@ class MqttUplink:
         client.subscribe(self._topic_cmd, qos=1)
         # wait_ack=False: dang chay TREN network thread cua paho, cho PUBACK
         # (wait_for_publish) tai day se tu khoa chinh no - xem docstring module.
-        self._publish(self._topic_status, {"online": True, "cmd": True}, retain=True, wait_ack=False)
+        # /hello co the tra ok ma api_key=None (Odoo chua tao pcm.device) - khai
+        # sig_cmd luc do thi edge cung khong co key de ky, moi lenh bi tu choi.
+        # Chi khai khi DA co key; key hoc sau thi agent._hello_loop goi
+        # announce_sig_cmd() khai lai giua phien.
+        self.sig_cmd = bool(self.api_key)
+        status = {"online": True, "cmd": True}
+        if self.sig_cmd:
+            status["sig_cmd"] = True
+        self._publish(self._topic_status, status, retain=True, wait_ack=False)
         _logger.info("mqtt uplink da ket noi %s:%s", settings.mqtt_uplink_host, settings.mqtt_uplink_port)
 
     def _on_message(self, client, userdata, msg):
@@ -125,8 +149,24 @@ class MqttUplink:
     def measurements(self, items: list, bid: str, seq: int) -> bool:
         return self._publish(self._topic_meas, {"items": items, "bid": bid, "seq": seq})
 
-    def ack_command(self, cmd_id: int, ok: bool, detail: str = "") -> bool:
-        return self._publish(self._topic_cmd_ack, {"id": cmd_id, "ok": ok, "detail": detail})
+    def announce_sig_cmd(self) -> bool:
+        """Khai "sig_cmd" giua phien khi key hoc duoc SAU luc connect (goi tu
+        _hello_loop - thread rieng, cho PUBACK an toan). Chi bat sig_cmd SAU
+        PUBACK: truoc do edge co the chua ky, bat bat buoc som se tu choi
+        nham lenh. That bai (chua ket noi) -> giu False, lan hello sau thu lai;
+        reconnect thi _on_connect tu khai."""
+        if not self.api_key:
+            return False
+        if self._publish(self._topic_status, {"online": True, "cmd": True, "sig_cmd": True}, retain=True):
+            self.sig_cmd = True
+            _logger.info("da khai sig_cmd giua phien MQTT (key hoc sau luc connect)")
+        return self.sig_cmd
+
+    def ack_command(self, cmd_id: int, ok: bool, detail: str = "", request_id: str = None) -> bool:
+        body = {"id": cmd_id, "ok": ok, "detail": detail}
+        if request_id:
+            body["request_id"] = request_id
+        return self._publish(self._topic_cmd_ack, body)
 
     def next_command(self, timeout: float):
         try:
