@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 EmitCb = Callable[[str, Optional[float], Optional[str], int, Optional[bool]], None]
 
-_MS_MAX = 2 ** 31 - 1      # khop ESP32 mqtt_link.c cmd_i32 (kep INT32_MAX)
+_MS_MAX = 2 ** 31 - 1      # matches ESP32 cmd_auth.c cmd_duration_ms() (clamp INT32_MAX)
 
 
 def _is_number(v) -> bool:
@@ -26,9 +26,10 @@ def onoff_level(value) -> Optional[bool]:
 
 
 def duration_ms(v) -> int:
-    """ms/period_ms cua lenh: None/<=0 -> 0 (khop cmd_i32 cua ESP32), kep
+    """ms/period_ms cua lenh: None/<=0 -> 0 (matches ESP32 cmd_auth.c cmd_duration_ms()), kep
     INT32_MAX (gia tri qua lon lam thread blink cua gpiozero chet OverflowError
-    trong khi lenh da bao ok). Khong phai so -> ValueError."""
+    trong khi lenh da bao ok). Khong phai so -> ValueError (ESP32 also rejects it,
+    ack ok:false, since esp32 367206b)."""
     if v is None:
         return 0
     if not _is_number(v) or v != v:          # v != v: NaN
